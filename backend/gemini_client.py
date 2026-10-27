@@ -12,12 +12,14 @@ Every Gemini call includes strict product fidelity instructions to prevent
 the model from altering colours, artwork, text, proportions, or branding.
 """
 
-import os
+from __future__ import annotations
+
 import base64
 import logging
-from typing import Optional
-from PIL import Image
+import os
 from io import BytesIO
+
+from PIL import Image
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +38,10 @@ EDIT INSTRUCTION:
 """
 
 
+class GeminiError(Exception):
+    """Raised when a Gemini image operation fails after all retries."""
+
+
 class GeminiClient:
     """
     Client for Google Gemini API image editing operations.
@@ -44,7 +50,7 @@ class GeminiClient:
     SDK: google-genai (official Google Gen AI SDK for Python)
     """
 
-    def __init__(self, api_key: Optional[str] = None):
+    def __init__(self, api_key: str | None = None):
         """
         Initialize the Gemini client.
 
@@ -76,7 +82,7 @@ class GeminiClient:
         image_path: str,
         prompt: str,
         output_path: str,
-        reference_images: Optional[list[str]] = None,
+        reference_images: list[str] | None = None,
     ) -> str:
         """
         Edit an image using Gemini's image-to-image editing capability.
@@ -142,7 +148,7 @@ class GeminiClient:
             except Exception as e:
                 logger.warning(f"Gemini edit attempt {attempt} failed: {e}")
                 if attempt == max_retries:
-                    raise Exception(
+                    raise GeminiError(
                         f"Gemini image edit failed after {max_retries} attempts. "
                         f"Last error: {e}"
                     ) from e
@@ -151,7 +157,7 @@ class GeminiClient:
         self,
         prompt: str,
         output_path: str,
-        reference_images: Optional[list[str]] = None,
+        reference_images: list[str] | None = None,
     ) -> str:
         """
         Generate a new image from a text prompt (text-to-image).
@@ -202,12 +208,12 @@ class GeminiClient:
             except Exception as e:
                 logger.warning(f"Gemini generate attempt {attempt} failed: {e}")
                 if attempt == max_retries:
-                    raise Exception(
+                    raise GeminiError(
                         f"Gemini image generation failed after {max_retries} attempts. "
                         f"Last error: {e}"
                     ) from e
 
-    def _extract_image_from_response(self, response) -> Optional[Image.Image]:
+    def _extract_image_from_response(self, response) -> Image.Image | None:
         """
         Extract a PIL Image from a Gemini API response.
         Handles different response formats across SDK versions.
@@ -215,11 +221,11 @@ class GeminiClient:
         # Try candidates (the standard response structure)
         if hasattr(response, "candidates") and response.candidates:
             for candidate in response.candidates:
-                if hasattr(candidate, "content") and candidate.content:
+                if hasattr(candidate, "content") and candidate.content:  # noqa: SIM102 — nested guards kept for readability
                     if hasattr(candidate.content, "parts") and candidate.content.parts:
                         for part in candidate.content.parts:
                             # Check for inline_data (image bytes)
-                            if hasattr(part, "inline_data") and part.inline_data:
+                            if hasattr(part, "inline_data") and part.inline_data:  # noqa: SIM102 — nested guards kept for readability
                                 if hasattr(part.inline_data, "data") and part.inline_data.data:
                                     img_data = part.inline_data.data
                                     if isinstance(img_data, bytes):
@@ -231,7 +237,7 @@ class GeminiClient:
         # Try the response.text or response.parts directly
         if hasattr(response, "parts") and response.parts:
             for part in response.parts:
-                if hasattr(part, "inline_data") and part.inline_data:
+                if hasattr(part, "inline_data") and part.inline_data:  # noqa: SIM102 — nested guards kept for readability
                     if hasattr(part.inline_data, "data") and part.inline_data.data:
                         img_data = part.inline_data.data
                         if isinstance(img_data, bytes):

@@ -5,17 +5,19 @@ Searches Boots.com for specific bundle products, downloads images,
 and identifies individual products within bundles.
 """
 
-import httpx
+from __future__ import annotations
+
 import os
 import re
-from typing import Optional
+
+import httpx
 from bs4 import BeautifulSoup
 
 X_AGENT_CLIENT = os.getenv("BOOTS_X_AGENT_CLIENT", "W-7njoVr89mFAk")
 
 
 class BootsCrawler:
-    def __init__(self, x_agent_client: Optional[str] = None):
+    def __init__(self, x_agent_client: str | None = None):
         self.x_agent_client = x_agent_client or X_AGENT_CLIENT
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -23,7 +25,7 @@ class BootsCrawler:
             "Accept-Language": "en-GB,en;q=0.9",
         }
 
-    async def search_bundle(self, product_code: str) -> Optional[dict]:
+    async def search_bundle(self, product_code: str) -> dict | None:
         """Search Boots.com for a specific bundle by product code."""
         search_url = f"https://www.boots.com/sitesearch?searchTerm={product_code}&x-agent-client={self.x_agent_client}"
 
@@ -95,7 +97,7 @@ class BootsCrawler:
 
         return ""
 
-    def _extract_main_image(self, soup: BeautifulSoup) -> Optional[str]:
+    def _extract_main_image(self, soup: BeautifulSoup) -> str | None:
         """Extract the main product image URL."""
         # Try JSON-LD
         for script in soup.find_all("script", type="application/ld+json"):
@@ -139,10 +141,9 @@ class BootsCrawler:
         products = []
 
         # Look for product references in the description
-        description = ""
         desc_div = soup.find("div", class_=re.compile("product-description|product-details|description"))
         if desc_div:
-            description = desc_div.get_text()
+            desc_div.get_text()
 
         # Look for JSON-LD with includes
         for script in soup.find_all("script", type="application/ld+json"):
@@ -182,11 +183,11 @@ class BootsCrawler:
             resp = await client.get(url, headers=self.headers, follow_redirects=True, timeout=60)
             resp.raise_for_status()
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            with open(save_path, "wb") as f:
+            with open(save_path, "wb") as f:  # noqa: ASYNC230 — small one-shot image write
                 f.write(resp.content)
         return save_path
 
-    async def get_product_image(self, product_code: str, save_dir: str) -> Optional[str]:
+    async def get_product_image(self, product_code: str, save_dir: str) -> str | None:
         """Search for an individual product and download its main image."""
         result = await self.search_bundle(product_code)
         if result and result.get("image_url"):

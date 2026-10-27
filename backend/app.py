@@ -27,25 +27,30 @@ Run on Render:
   uvicorn app:app --host 0.0.0.0 --port $PORT
 """
 
-import os
+from __future__ import annotations
+
 import io
 import json
-import zipfile
 import logging
-import shutil
-from typing import Optional
+import os
+import zipfile
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
+# Load variables from a local .env file for development (no-op in production,
+# where Render/Vercel inject env vars directly).
+load_dotenv()
+
 # Import our modules
-from monday_client import MondayClient
 from boots_crawler import BootsCrawler
-from image_composer import ImageComposer
-from gemini_client import GeminiClient
 from bundle_processor import BundleProcessor
+from gemini_client import GeminiClient
+from image_composer import ImageComposer
+from monday_client import MondayClient
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -62,12 +67,19 @@ UPLOADS_DIR = os.getenv("UPLOADS_DIR", "uploads")
 ROUNDEL_PATH = os.path.join(os.path.dirname(__file__), "roundel.png")
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 
+# File-backed store so approvals survive process restarts (the in-memory dict
+# alone is lost whenever Render restarts/sleeps the service).
+APPROVED_STORE = os.path.join(UPLOADS_DIR, "_approved.json")
+
 # Environment variables
 MONDAY_API_TOKEN = os.getenv("MONDAY_API_TOKEN", "")
 MONDAY_BOARD_ID = os.getenv("MONDAY_BOARD_ID", "5100428483")
 BOOTS_X_AGENT_CLIENT = os.getenv("BOOTS_X_AGENT_CLIENT", "W-7njoVr89mFAk")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
+CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()]
+# Browsers reject `Access-Control-Allow-Origin: *` together with credentials,
+# so only allow credentials when explicit origins are configured.
+CORS_ALLOW_CREDENTIALS = CORS_ORIGINS != ["*"]
 
 # In-memory storage for approved bundles (simple — no database needed for v1)
 # In production, this could be replaced with a database or file-based store
@@ -88,7 +100,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
-    allow_credentials=True,
+    allow_credentials=CORS_ALLOW_CREDENTIALS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -101,7 +113,7 @@ class GenerateRequest(BaseModel):
     bundle_code: str
     product_image_paths: list[str]
     quantities: list[int] = []
-    gap: Optional[int] = None
+    gap: int | None = None
 
 
 class EditRequest(BaseModel):
@@ -153,6 +165,42 @@ def get_gemini_client() -> GeminiClient:
 def get_processor() -> BundleProcessor:
     """Create a BundleProcessor instance."""
     return BundleProcessor()
+
+
+def safe_upload_path(path: str) -> str | None:
+    """Resolve a client-supplied path and confirm it stays inside UPLOADS_DIR.
+
+    Returns the absolute path if safe, otherwise None. This prevents path
+    traversal / arbitrary local file reads through the paths that /api/generate,
+    /api/edit, and /api/approve accept from the frontend.
+    """
+    uploads_abs = os.path.abspath(UPLOADS_DIR)
+    target = os.path.abspath(path)
+    try:
+        if os.path.commonpath([uploads_abs, target]) != uploads_abs:
+            return None
+    except ValueError:
+        # Paths on different drives (Windows) raise ValueError.
+        return None
+    return target
+
+
+def load_approved() -> dict:
+    """Load the persisted approved-bundles store from disk."""
+    try:
+        with open(APPROVED_STORE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_approved() -> None:
+    """Persist the approved-bundles store to disk (best-effort)."""
+    try:
+        with open(APPROVED_STORE, "w") as f:
+            json.dump(approved_bundles, f)
+    except OSError as e:
+        logger.warning(f"Could not persist approved bundles: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -228,8 +276,8 @@ async def get_bundles(refresh: bool = Query(False, description="Force re-fetch f
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Failed to fetch bundles: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to fetch bundles: {str(e)}")
+        logger.exception("Failed to fetch bundles")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch bundles: {e!s}")
 
 
 @app.get("/api/bundle/{code}")
@@ -251,8 +299,8 @@ async def get_bundle(code: str):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Failed to fetch bundle {code}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch bundle: {str(e)}")
+        logger.exception(f"Failed to fetch bundle {code}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch bundle: {e!s}")
 
 
 @app.post("/api/generate")
@@ -265,8 +313,12 @@ async def generate_image(request: GenerateRequest):
         composer = get_composer()
         output_path = os.path.join(UPLOADS_DIR, f"{request.bundle_code}_generated.jpg")
 
-        # Validate product image paths exist
-        valid_paths = [p for p in request.product_image_paths if os.path.exists(p)]
+        # Validate product image paths exist and stay within the uploads dir
+        valid_paths = []
+        for p in request.product_image_paths:
+            safe = safe_upload_path(p)
+            if safe and os.path.exists(safe):
+                valid_paths.append(safe)
         if not valid_paths:
             raise HTTPException(
                 status_code=400,
@@ -292,8 +344,8 @@ async def generate_image(request: GenerateRequest):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Failed to generate image: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Image generation failed: {str(e)}")
+        logger.exception("Failed to generate image")
+        raise HTTPException(status_code=500, detail=f"Image generation failed: {e!s}")
 
 
 @app.post("/api/edit")
@@ -310,6 +362,15 @@ async def edit_image(request: EditRequest):
         composer = get_composer()
         output_path = os.path.join(UPLOADS_DIR, f"{request.bundle_code}_edited.jpg")
 
+        # Validate the source image path stays within the uploads dir
+        safe_image = safe_upload_path(request.image_path)
+        if not safe_image or not os.path.exists(safe_image):
+            raise HTTPException(status_code=400, detail=f"Image not found: {request.image_path}")
+        safe_refs = [
+            s for s in (safe_upload_path(p) for p in request.reference_image_paths)
+            if s and os.path.exists(s)
+        ]
+
         # Step 1: Try programmatic edit first
         prompt_lower = request.edit_prompt.lower().strip()
         programmatic_keywords = [
@@ -325,7 +386,7 @@ async def edit_image(request: EditRequest):
         if is_programmatic:
             logger.info(f"Using PIL for programmatic edit: '{request.edit_prompt[:60]}'")
             result_path = composer.edit_bundle_image(
-                current_image_path=request.image_path,
+                current_image_path=safe_image,
                 edit_prompt=request.edit_prompt,
                 output_path=output_path,
             )
@@ -341,14 +402,14 @@ async def edit_image(request: EditRequest):
         gemini = get_gemini_client()
 
         result_path = gemini.edit_image(
-            image_path=request.image_path,
+            image_path=safe_image,
             prompt=request.edit_prompt,
             output_path=output_path,
-            reference_images=request.reference_image_paths if request.reference_image_paths else None,
+            reference_images=safe_refs or None,
         )
 
         # Step 3: Run a basic fidelity check
-        fidelity = gemini.check_fidelity(request.image_path, result_path)
+        fidelity = gemini.check_fidelity(safe_image, result_path)
         if not fidelity["passed"]:
             logger.warning(f"Fidelity check failed for {request.bundle_code}: {fidelity['issues']}")
             return {
@@ -369,8 +430,8 @@ async def edit_image(request: EditRequest):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Failed to edit image: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Image edit failed: {str(e)}")
+        logger.exception("Failed to edit image")
+        raise HTTPException(status_code=500, detail=f"Image edit failed: {e!s}")
 
 
 @app.post("/api/approve")
@@ -381,15 +442,17 @@ async def approve_image(request: ApproveRequest):
     """
     from datetime import datetime, timezone
 
-    if not os.path.exists(request.image_path):
+    safe_image = safe_upload_path(request.image_path)
+    if not safe_image or not os.path.exists(safe_image):
         raise HTTPException(status_code=400, detail=f"Image not found: {request.image_path}")
 
     approved_bundles[request.bundle_code] = {
         "code": request.bundle_code,
         "title": request.title,
-        "image_path": request.image_path,
-        "approved_at": datetime.now(timezone.utc).isoformat(),
+        "image_path": safe_image,
+        "approved_at": datetime.now(timezone.utc).isoformat(),  # noqa: UP017 — keep 3.9+ compatibility
     }
+    save_approved()
 
     logger.info(f"Approved bundle: {request.bundle_code} — {request.title}")
     return {
@@ -404,6 +467,7 @@ async def reject_image(request: RejectRequest):
     """Send a bundle back to manual review."""
     if request.bundle_code in approved_bundles:
         del approved_bundles[request.bundle_code]
+        save_approved()
         logger.info(f"Rejected (un-approved) bundle: {request.bundle_code}")
 
     logger.info(f"Bundle {request.bundle_code} sent to manual review: {request.reason}")
@@ -440,7 +504,7 @@ async def export_approved():
         zip_buffer,
         media_type="application/zip",
         headers={
-            "Content-Disposition": f"attachment; filename=approved_bundle_images.zip"
+            "Content-Disposition": "attachment; filename=approved_bundle_images.zip"
         },
     )
 
@@ -457,7 +521,7 @@ async def get_approved():
 @app.post("/api/upload")
 async def upload_image(
     bundle_code: str = Form(...),
-    file: UploadFile = File(...),
+    file: UploadFile = File(...),  # noqa: B008 — required FastAPI dependency idiom
 ):
     """
     Upload a supplier-provided image for a bundle.
@@ -475,7 +539,7 @@ async def upload_image(
     # Save the uploaded file
     file_ext = os.path.splitext(file.filename or "image.jpg")[1] or ".jpg"
     upload_path = os.path.join(UPLOADS_DIR, f"{bundle_code}_uploaded{file_ext}")
-    with open(upload_path, "wb") as f:
+    with open(upload_path, "wb") as f:  # noqa: ASYNC230 — small one-shot write
         f.write(contents)
 
     logger.info(f"Uploaded image for bundle {bundle_code}: {upload_path}")
@@ -503,8 +567,10 @@ async def serve_image(filename: str):
 
 @app.on_event("startup")
 async def startup_event():
+    approved_bundles.update(load_approved())
     logger.info("=" * 60)
     logger.info("Boots Bundle Image Studio API starting up...")
+    logger.info(f"  Restored {len(approved_bundles)} approved bundle(s) from disk")
     logger.info(f"  Monday.com Board ID: {MONDAY_BOARD_ID}")
     logger.info(f"  Uploads directory: {UPLOADS_DIR}")
     logger.info(f"  Gemini API key: {'configured' if GEMINI_API_KEY else 'NOT SET'}")
@@ -519,5 +585,5 @@ async def startup_event():
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 8000))
+    port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port)

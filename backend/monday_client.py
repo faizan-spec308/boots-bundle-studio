@@ -5,12 +5,12 @@ Fetches the Commercial Core Line List and 2am Report from Monday.com,
 identifies Virtual Bundle lines, and cross-references for live status.
 """
 
+from __future__ import annotations
+
+import os
+
 import httpx
 import openpyxl
-import io
-import os
-from datetime import datetime
-from typing import Optional
 
 
 class MondayClient:
@@ -20,7 +20,7 @@ class MondayClient:
         self.base_url = "https://api.monday.com/v2"
         self.headers = {"Authorization": api_token, "Content-Type": "application/json"}
 
-    async def _graphql(self, query: str, variables: dict = None) -> dict:
+    async def _graphql(self, query: str, variables: dict | None = None) -> dict:
         """Execute a GraphQL query against Monday.com API."""
         async with httpx.AsyncClient() as client:
             resp = await client.post(
@@ -30,7 +30,13 @@ class MondayClient:
                 timeout=60,
             )
             resp.raise_for_status()
-            return resp.json()
+            result = resp.json()
+            # Monday returns HTTP 200 even for query errors, with the details
+            # under "errors" (and often no "data"). Surface them clearly instead
+            # of letting callers trip over a KeyError on result["data"].
+            if result.get("errors"):
+                raise ValueError(f"Monday API error: {result['errors']}")
+            return result
 
     async def get_board_items(self, limit: int = 500) -> list:
         """Fetch all items from the Data Files board."""
@@ -86,7 +92,7 @@ class MondayClient:
     async def get_asset_url(self, asset_id: str) -> str:
         """Get the public download URL for an asset."""
         query = """
-        query GetAssets($ids: [Int!]) {
+        query GetAssets($ids: [ID!]!) {
             assets(ids: $ids) {
                 id
                 name
@@ -95,7 +101,7 @@ class MondayClient:
             }
         }
         """
-        data = await self._graphql(query, {"ids": [int(asset_id)]})
+        data = await self._graphql(query, {"ids": [str(asset_id)]})
         assets = data["data"]["assets"]
         if assets:
             return assets[0].get("public_url") or assets[0].get("url")
@@ -107,11 +113,11 @@ class MondayClient:
             resp = await client.get(url, follow_redirects=True, timeout=120)
             resp.raise_for_status()
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            with open(save_path, "wb") as f:
+            with open(save_path, "wb") as f:  # noqa: ASYNC230 — small one-shot file download
                 f.write(resp.content)
         return save_path
 
-    def _extract_asset_id_from_file_column(self, column_value: str) -> Optional[str]:
+    def _extract_asset_id_from_file_column(self, column_value: str) -> str | None:
         """Extract the asset ID from a file column value URL."""
         if not column_value:
             return None
@@ -148,7 +154,7 @@ class MondayClient:
                     import json
                     try:
                         val = json.loads(cv["value"])
-                        if "files" in val and val["files"]:
+                        if val.get("files"):
                             asset_id = str(val["files"][0].get("assetId"))
                     except (json.JSONDecodeError, KeyError):
                         pass

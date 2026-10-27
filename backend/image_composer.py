@@ -9,10 +9,11 @@ This replaces the AI generate_image approach which was slow (30 min) and
 altered product colours, artwork, text, and proportions.
 """
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from __future__ import annotations
+
 import os
-import math
-from typing import Optional
+
+from PIL import Image, ImageDraw, ImageFilter
 
 
 class ImageComposer:
@@ -24,16 +25,16 @@ class ImageComposer:
     SHADOW_BLUR = 20
     SHADOW_HEIGHT = 30
 
-    def __init__(self, roundel_path: Optional[str] = None):
+    def __init__(self, roundel_path: str | None = None):
         self.roundel_path = roundel_path
 
     def compose_bundle_image(
         self,
         product_images: list[str],
         output_path: str,
-        quantities: list[int] = None,
-        gap: int = None,
-        max_height: int = None,
+        quantities: list[int] | None = None,
+        gap: int | None = None,
+        max_height: int | None = None,
     ) -> str:
         """
         Compose a bundle image from individual product photos.
@@ -67,9 +68,6 @@ class ImageComposer:
         if len(expanded_images) >= 6 and len(set(expanded_images)) == 1:
             use_roundel = True
             expanded_images = [expanded_images[0]]  # Just use one image
-            total_quantity = sum(quantities) if quantities else len(expanded_images)
-        else:
-            total_quantity = len(expanded_images)
 
         # Load and process all product images
         processed_products = []
@@ -159,7 +157,7 @@ class ImageComposer:
     def _resize_product(self, img: Image.Image, max_height: int) -> Image.Image:
         """Resize a product image to fit within max_height while keeping aspect ratio."""
         # If the image is already smaller than max_height, don't upscale
-        if img.height <= max_height:
+        if img.height <= max_height:  # noqa: SIM102 — nested check kept for clarity
             # But check if width is too large
             if img.width <= self.CANVAS_SIZE * 0.4:
                 return img
@@ -266,7 +264,7 @@ class ImageComposer:
         product_image_paths: list[str],
         quantities: list[int],
         output_path: str,
-        gap: int = None,
+        gap: int | None = None,
     ) -> str:
         """
         Compose a bundle image from individual product photos with quantities.

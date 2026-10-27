@@ -15,9 +15,9 @@ Applies bundle arrangement rules from the requirements document:
   - If composition can't be determined confidently → Manual Review
 """
 
-import os
 import logging
-from typing import Optional
+import os
+
 from PIL import Image
 
 logger = logging.getLogger(__name__)
@@ -69,7 +69,7 @@ class BundleProcessor:
 
         try:
             bundle_img = Image.open(bundle_image_path).convert("RGB")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — any open failure counts as unusable
             return {
                 'score': 0.0,
                 'issues': [f'Cannot open bundle image: {e}'],
@@ -274,35 +274,47 @@ class BundleProcessor:
             logger.info(f"Processing bundle: {code} — {title}")
 
             product_image_paths = []
+            product_quantities = []  # kept aligned with product_image_paths
             original_image_path = None
             product_images_found = False
+
+            # Monday rows carry no per-product breakdown, so fall back to the
+            # individual products discovered on the bundle's Boots.com page.
+            products = list(bundle.get('products') or [])
 
             # Step 1: Crawl Boots.com for the bundle's current image + individual product images
             if crawler:
                 try:
-                    # Look up the bundle's current Boots.com page to get its main image URL,
-                    # then download it as the "original" image for quality assessment.
+                    # Look up the bundle's current Boots.com page: its main image
+                    # (for quality assessment) and its individual products.
                     bundle_info = await crawler.search_bundle(code)
-                    if bundle_info and bundle_info.get('image_url'):
-                        original_image_path = os.path.join(uploads_dir, f"{code}_original.jpg")
-                        await crawler.download_image(bundle_info['image_url'], original_image_path)
-                    else:
-                        original_image_path = None
+                    if bundle_info:
+                        if bundle_info.get('image_url'):
+                            original_image_path = os.path.join(uploads_dir, f"{code}_original.jpg")
+                            await crawler.download_image(bundle_info['image_url'], original_image_path)
+                        if not products and bundle_info.get('individual_products'):
+                            products = list(bundle_info['individual_products'])
+                        if not title and bundle_info.get('title'):
+                            title = bundle_info['title']
 
-                    # Download individual product images (crawler names them by product code)
-                    for product in bundle.get('products', []):
+                    # Download each product image; record its local path + quantity
+                    for product in products:
                         product_code = product.get('code', '')
-                        if product_code:
-                            img = await crawler.get_product_image(product_code, uploads_dir)
-                            if img and os.path.exists(img):
-                                product_image_paths.append(img)
-                except Exception as e:
+                        if not product_code:
+                            continue
+                        img = await crawler.get_product_image(product_code, uploads_dir)
+                        if img and os.path.exists(img):
+                            product['image_path'] = img
+                            product_image_paths.append(img)
+                            product_quantities.append(product.get('quantity', 1))
+                except Exception as e:  # noqa: BLE001 — crawl failures must not abort the batch
                     logger.warning(f"Crawler failed for {code}: {e}")
             else:
                 # Use any product image paths already in the bundle data
-                for product in bundle.get('products', []):
+                for product in products:
                     if product.get('image_path') and os.path.exists(product['image_path']):
                         product_image_paths.append(product['image_path'])
+                        product_quantities.append(product.get('quantity', 1))
 
             product_images_found = len(product_image_paths) > 0
 
@@ -317,7 +329,7 @@ class BundleProcessor:
                 }
 
             # Step 3: Determine arrangement
-            arrangement = self.determine_arrangement(bundle.get('products', []))
+            arrangement = self.determine_arrangement(products)
 
             # Step 4: Determine if we can compose
             can_compose = (
@@ -339,15 +351,14 @@ class BundleProcessor:
             if category == 'ready' and can_compose and composer:
                 try:
                     generated_image_path = os.path.join(uploads_dir, f"{code}_generated.jpg")
-                    quantities = [p.get('quantity', 1) for p in bundle.get('products', [])]
                     composer.compose_bundle_image(
                         product_images=product_image_paths,
                         output_path=generated_image_path,
-                        quantities=quantities,
+                        quantities=product_quantities,
                     )
                     logger.info(f"Generated composed image for {code}")
-                except Exception as e:
-                    logger.error(f"Failed to generate image for {code}: {e}")
+                except Exception:
+                    logger.exception(f"Failed to generate image for {code}")
                     # Fall back to manual review if composition fails
                     category = 'manual'
 
@@ -358,7 +369,7 @@ class BundleProcessor:
                 'category': category,
                 'original_image': original_image_path,
                 'generated_image': generated_image_path,
-                'products': bundle.get('products', []),
+                'products': products,
                 'quality_score': quality['score'],
                 'quality_issues': quality['issues'],
                 'arrangement_reasoning': arrangement['reasoning'],
@@ -407,7 +418,7 @@ class BundleProcessor:
         This is a basic heuristic — not a full OCR check.
         Returns True if a suspicious region is found.
         """
-        w, h = img.size
+        w, _h = img.size
         # Check the top-right corner area (where badges are typically placed)
         corner = img.crop((w - 200, 0, w, 200)).resize((50, 50))
         pixels = list(corner.getdata())

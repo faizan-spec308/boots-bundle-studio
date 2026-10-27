@@ -8,6 +8,12 @@ services:
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /healthz
     autoDeployTrigger: 'off'
+    # Persistent disk so downloaded/generated/approved images and the approvals
+    # store survive restarts (the instance filesystem is otherwise ephemeral).
+    disk:
+      name: uploads
+      mountPath: /var/data/uploads
+      sizeGB: 1
     envVars:
       - key: GEMINI_API_KEY
         sync: false
@@ -20,4 +26,4 @@ services:
       - key: CORS_ORIGINS
         sync: false
       - key: UPLOADS_DIR
-        value: "uploads"
+        value: "/var/data/uploads"
