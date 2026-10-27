@@ -159,8 +159,9 @@ class RejectRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 def get_monday_client() -> MondayClient:
-    """Create a MondayClient instance from environment variables."""
-    if not MONDAY_API_TOKEN:
+    """Create a MondayClient instance from environment variables.
+    The API token isn't required in local-files testing mode (no download)."""
+    if not MONDAY_API_TOKEN and not USE_LOCAL_FILES:
         raise HTTPException(status_code=500, detail="MONDAY_API_TOKEN not configured")
     return MondayClient(api_token=MONDAY_API_TOKEN, board_id=MONDAY_BOARD_ID)
 
@@ -257,6 +258,9 @@ async def readyz():
 # ---------------------------------------------------------------------------
 
 DEFAULT_BUNDLE_LIMIT = int(os.getenv("BUNDLE_PROCESS_LIMIT", "24"))
+# Testing toggle: skip the Monday.com download and parse the local files in
+# ORIGINALS_DIR instead (also bypasses the confirmed-live cache so parsing runs).
+USE_LOCAL_FILES = os.getenv("USE_LOCAL_FILES", "").strip().lower() in ("1", "true", "yes")
 
 
 def _bundles_payload() -> dict:
@@ -291,7 +295,7 @@ async def _load_bundles_job(refresh: bool, limit: int) -> None:
         cache_path = os.path.join(ORIGINALS_DIR, "confirmed_live.json")
         cache_ttl = int(os.getenv("CONFIRMED_CACHE_TTL", "21600"))  # 6 hours
         confirmed = None
-        if not refresh and os.path.exists(cache_path):
+        if not refresh and not USE_LOCAL_FILES and os.path.exists(cache_path):
             age = time.time() - os.path.getmtime(cache_path)
             if age < cache_ttl:
                 _bundle_load["phase"] = "Loading cached bundle list…"
@@ -310,6 +314,7 @@ async def _load_bundles_job(refresh: bool, limit: int) -> None:
 
             confirmed = await monday.get_confirmed_live_bundles(
                 refresh=refresh, originals_dir=ORIGINALS_DIR, phase_cb=_phase,
+                use_local_files=USE_LOCAL_FILES,
             )
             try:
                 with open(cache_path, "w") as f:  # noqa: ASYNC230 — small cache write

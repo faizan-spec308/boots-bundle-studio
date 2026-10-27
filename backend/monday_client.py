@@ -332,6 +332,7 @@ class MondayClient:
 
     async def get_confirmed_live_bundles(
         self, refresh: bool = True, originals_dir: str = "./originals", phase_cb=None,
+        use_local_files: bool = False,
     ) -> list:
         """
         Complete pipeline: fetch both files, identify Virtual Bundles,
@@ -341,6 +342,9 @@ class MondayClient:
         re-downloaded when `refresh` is True or they are missing. Parsing (CPU-heavy
         openpyxl work) runs in a worker thread so it never blocks the event loop.
         `phase_cb(str)`, if given, is called with a human-readable phase label.
+
+        When `use_local_files` is True, the Monday.com download is skipped entirely
+        and the existing files in `originals_dir` are parsed (for local testing).
         """
         def phase(msg: str) -> None:
             if phase_cb:
@@ -349,13 +353,21 @@ class MondayClient:
         core_path = os.path.join(originals_dir, "core_line_list.xlsx")
         report_path = os.path.join(originals_dir, "2am_report.xlsx")
 
-        # Download only when asked to refresh or when the cached files are missing
-        if refresh or not os.path.exists(core_path):
-            phase("Downloading Core Line List (~40MB) from Monday.com…")
-            await self.fetch_core_line_list(core_path)
-        if refresh or not os.path.exists(report_path):
-            phase("Downloading 2am report from Monday.com…")
-            await self.fetch_2am_report(report_path)
+        if use_local_files:
+            missing = [p for p in (core_path, report_path) if not os.path.exists(p)]
+            if missing:
+                raise FileNotFoundError(
+                    f"use_local_files=True but these files are missing: {missing}"
+                )
+            phase("Using local files (skipping Monday.com download)…")
+        else:
+            # Download only when asked to refresh or when the cached files are missing
+            if refresh or not os.path.exists(core_path):
+                phase("Downloading Core Line List (~40MB) from Monday.com…")
+                await self.fetch_core_line_list(core_path)
+            if refresh or not os.path.exists(report_path):
+                phase("Downloading 2am report from Monday.com…")
+                await self.fetch_2am_report(report_path)
 
         # Parse off the event loop (these block on large spreadsheets)
         phase("Parsing Core Line List…")
