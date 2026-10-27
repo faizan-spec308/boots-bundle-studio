@@ -24,52 +24,56 @@ class BootsCrawler:
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-GB,en;q=0.9",
         }
+        # A single shared, connection-pooled client reused across all requests
+        # (much faster than creating a new client per request under concurrency).
+        self._client = httpx.AsyncClient(
+            headers=self.headers,
+            follow_redirects=True,
+            timeout=30,
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
+
+    async def close(self) -> None:
+        """Close the shared HTTP client. Call on application shutdown."""
+        await self._client.aclose()
 
     async def search_bundle(self, product_code: str) -> dict | None:
         """Search Boots.com for a specific bundle by product code."""
         search_url = f"https://www.boots.com/sitesearch?searchTerm={product_code}&x-agent-client={self.x_agent_client}"
 
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(search_url, headers=self.headers, follow_redirects=True, timeout=30)
-            if resp.status_code != 200:
-                return None
+        resp = await self._client.get(search_url)
+        if resp.status_code != 200:
+            return None
 
-            html = resp.text
-            soup = BeautifulSoup(html, "html.parser")
+        soup = BeautifulSoup(resp.text, "html.parser")
 
-            # Find the first product link
-            product_link = None
-            for a in soup.find_all("a", href=True):
-                href = a["href"]
-                if "/product/" in href or re.search(r"/\d{8}", href):
-                    product_link = href if href.startswith("http") else f"https://www.boots.com{href}"
-                    break
+        # Find the first product link
+        product_link = None
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if "/product/" in href or re.search(r"/\d{8}", href):
+                product_link = href if href.startswith("http") else f"https://www.boots.com{href}"
+                break
 
-            if not product_link:
-                return None
+        if not product_link:
+            return None
 
-            # Fetch the product page
-            product_url = f"{product_link}?x-agent-client={self.x_agent_client}"
-            resp2 = await client.get(product_url, headers=self.headers, follow_redirects=True, timeout=30)
-            if resp2.status_code != 200:
-                return None
+        # Fetch the product page
+        product_url = f"{product_link}?x-agent-client={self.x_agent_client}"
+        resp2 = await self._client.get(product_url)
+        if resp2.status_code != 200:
+            return None
 
-            product_html = resp2.text
-            product_soup = BeautifulSoup(product_html, "html.parser")
+        product_soup = BeautifulSoup(resp2.text, "html.parser")
 
-            # Extract product details
-            title = self._extract_title(product_soup)
-            image_url = self._extract_main_image(product_soup)
-            bundle_code = self._extract_bundle_code(product_url)
-            individual_products = self._extract_individual_products(product_soup)
-
-            return {
-                "code": bundle_code,
-                "title": title,
-                "image_url": image_url,
-                "product_url": product_url,
-                "individual_products": individual_products,
-            }
+        # Extract product details
+        return {
+            "code": self._extract_bundle_code(product_url),
+            "title": self._extract_title(product_soup),
+            "image_url": self._extract_main_image(product_soup),
+            "product_url": product_url,
+            "individual_products": self._extract_individual_products(product_soup),
+        }
 
     def _extract_title(self, soup: BeautifulSoup) -> str:
         """Extract the product title from the page."""
@@ -155,10 +159,14 @@ class BootsCrawler:
                 # Check for isBundleOf or includes
                 includes = data.get("isBundleOf") or data.get("includes") or []
                 for item in includes:
+                    img = item.get("image")
+                    if isinstance(img, list):
+                        img = img[0] if img else None
                     products.append({
                         "name": item.get("name", ""),
                         "code": str(item.get("sku", "")),
                         "quantity": 1,
+                        "image_url": img,
                     })
             except (json.JSONDecodeError, TypeError):
                 pass
@@ -179,19 +187,34 @@ class BootsCrawler:
 
     async def download_image(self, url: str, save_path: str) -> str:
         """Download an image from a URL and save it locally."""
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(url, headers=self.headers, follow_redirects=True, timeout=60)
-            resp.raise_for_status()
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            with open(save_path, "wb") as f:  # noqa: ASYNC230 — small one-shot image write
-                f.write(resp.content)
+        resp = await self._client.get(url, timeout=60)
+        resp.raise_for_status()
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        with open(save_path, "wb") as f:  # noqa: ASYNC230 — small one-shot image write
+            f.write(resp.content)
         return save_path
 
+    async def download_product_image(self, product_code: str, image_url: str | None, save_dir: str) -> str | None:
+        """Download a product image by URL, skipping the network if it's already
+        cached on disk. Returns the local path or None."""
+        save_path = os.path.join(save_dir, f"{product_code}.jpg")
+        if os.path.exists(save_path):
+            return save_path
+        if not image_url:
+            return None
+        try:
+            return await self.download_image(image_url, save_path)
+        except (httpx.HTTPError, OSError):
+            return None
+
     async def get_product_image(self, product_code: str, save_dir: str) -> str | None:
-        """Search for an individual product and download its main image."""
+        """Search for an individual product and download its main image.
+        Returns the cached path immediately if the image already exists."""
+        save_path = os.path.join(save_dir, f"{product_code}.jpg")
+        if os.path.exists(save_path):
+            return save_path
         result = await self.search_bundle(product_code)
         if result and result.get("image_url"):
-            save_path = os.path.join(save_dir, f"{product_code}.jpg")
             await self.download_image(result["image_url"], save_path)
             return save_path
         return None

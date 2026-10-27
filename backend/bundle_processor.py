@@ -15,6 +15,7 @@ Applies bundle arrangement rules from the requirements document:
   - If composition can't be determined confidently → Manual Review
 """
 
+import asyncio
 import logging
 import os
 
@@ -241,6 +242,7 @@ class BundleProcessor:
         composer=None,
         uploads_dir: str = "uploads",
         progress_cb=None,
+        max_concurrency: int = 8,
     ) -> list[dict]:
         """
         Full pipeline: assess quality, crawl for product images, categorize, and
@@ -267,117 +269,25 @@ class BundleProcessor:
             }
         """
         os.makedirs(uploads_dir, exist_ok=True)
-        results = []
+        total = len(bundles)
+        results: list = [None] * total
 
-        for bundle in bundles:
-            code = bundle.get('code', '')
-            title = bundle.get('title', '')
-            logger.info(f"Processing bundle: {code} — {title}")
+        # Process bundles concurrently, bounded by a semaphore so we never open
+        # more than `max_concurrency` crawls at once.
+        sem = asyncio.Semaphore(max_concurrency)
+        counter = {"done": 0}
+        lock = asyncio.Lock()
 
-            product_image_paths = []
-            product_quantities = []  # kept aligned with product_image_paths
-            original_image_path = None
-            product_images_found = False
+        async def worker(index: int, bundle: dict) -> None:
+            async with sem:
+                result = await self._process_one(bundle, crawler, composer, uploads_dir)
+            results[index] = result
+            async with lock:
+                counter["done"] += 1
+                if progress_cb:
+                    progress_cb(counter["done"], total)
 
-            # Monday rows carry no per-product breakdown, so fall back to the
-            # individual products discovered on the bundle's Boots.com page.
-            products = list(bundle.get('products') or [])
-
-            # Step 1: Crawl Boots.com for the bundle's current image + individual product images
-            if crawler:
-                try:
-                    # Look up the bundle's current Boots.com page: its main image
-                    # (for quality assessment) and its individual products.
-                    bundle_info = await crawler.search_bundle(code)
-                    if bundle_info:
-                        if bundle_info.get('image_url'):
-                            original_image_path = os.path.join(uploads_dir, f"{code}_original.jpg")
-                            await crawler.download_image(bundle_info['image_url'], original_image_path)
-                        if not products and bundle_info.get('individual_products'):
-                            products = list(bundle_info['individual_products'])
-                        if not title and bundle_info.get('title'):
-                            title = bundle_info['title']
-
-                    # Download each product image; record its local path + quantity
-                    for product in products:
-                        product_code = product.get('code', '')
-                        if not product_code:
-                            continue
-                        img = await crawler.get_product_image(product_code, uploads_dir)
-                        if img and os.path.exists(img):
-                            product['image_path'] = img
-                            product_image_paths.append(img)
-                            product_quantities.append(product.get('quantity', 1))
-                except Exception as e:  # noqa: BLE001 — crawl failures must not abort the batch
-                    logger.warning(f"Crawler failed for {code}: {e}")
-            else:
-                # Use any product image paths already in the bundle data
-                for product in products:
-                    if product.get('image_path') and os.path.exists(product['image_path']):
-                        product_image_paths.append(product['image_path'])
-                        product_quantities.append(product.get('quantity', 1))
-
-            product_images_found = len(product_image_paths) > 0
-
-            # Step 2: Assess quality of the current bundle image
-            if original_image_path and os.path.exists(original_image_path):
-                quality = self.assess_quality(original_image_path, product_image_paths)
-            else:
-                quality = {
-                    'score': 0.0,
-                    'issues': ['No original bundle image available'],
-                    'needs_regeneration': True,
-                }
-
-            # Step 3: Determine arrangement
-            arrangement = self.determine_arrangement(products)
-
-            # Step 4: Determine if we can compose
-            can_compose = (
-                product_images_found and
-                not arrangement['manual_review'] and
-                arrangement['single_image']
-            )
-
-            # Step 5: Categorize
-            category = self.categorize_bundle(
-                bundle=bundle,
-                quality_assessment=quality,
-                product_images_found=product_images_found,
-                can_compose=can_compose,
-            )
-
-            # Step 6: Generate composed image if needed and possible
-            generated_image_path = None
-            if category == 'ready' and can_compose and composer:
-                try:
-                    generated_image_path = os.path.join(uploads_dir, f"{code}_generated.jpg")
-                    composer.compose_bundle_image(
-                        product_images=product_image_paths,
-                        output_path=generated_image_path,
-                        quantities=product_quantities,
-                    )
-                    logger.info(f"Generated composed image for {code}")
-                except Exception:
-                    logger.exception(f"Failed to generate image for {code}")
-                    # Fall back to manual review if composition fails
-                    category = 'manual'
-
-            # Step 7: Build result
-            result = {
-                'code': code,
-                'title': title,
-                'category': category,
-                'original_image': original_image_path,
-                'generated_image': generated_image_path,
-                'products': products,
-                'quality_score': quality['score'],
-                'quality_issues': quality['issues'],
-                'arrangement_reasoning': arrangement['reasoning'],
-            }
-            results.append(result)
-            if progress_cb:
-                progress_cb(len(results), len(bundles))
+        await asyncio.gather(*(worker(i, b) for i, b in enumerate(bundles)))
 
         logger.info(f"Processed {len(results)} bundles: "
                      f"{sum(1 for r in results if r['category'] == 'ready')} ready, "
@@ -385,6 +295,127 @@ class BundleProcessor:
                      f"{sum(1 for r in results if r['category'] == 'manual')} manual")
 
         return results
+
+    async def _process_one(self, bundle: dict, crawler, composer, uploads_dir: str) -> dict:
+        """Crawl, assess, categorize, and (if possible) compose a single bundle."""
+        code = bundle.get('code', '')
+        title = bundle.get('title', '')
+
+        product_image_paths = []
+        product_quantities = []  # kept aligned with product_image_paths
+        original_image_path = None
+
+        # Monday rows carry no per-product breakdown, so fall back to the
+        # individual products discovered on the bundle's Boots.com page.
+        products = list(bundle.get('products') or [])
+
+        # Step 1: Crawl Boots.com — ONE page load gives the bundle's main image and
+        # its individual products (with image URLs). We then download those images
+        # directly instead of re-searching each product. Cached files are reused.
+        if crawler:
+            try:
+                bundle_info = await crawler.search_bundle(code)
+                if bundle_info:
+                    if bundle_info.get('image_url'):
+                        candidate = os.path.join(uploads_dir, f"{code}_original.jpg")
+                        if os.path.exists(candidate):
+                            original_image_path = candidate
+                        else:
+                            await crawler.download_image(bundle_info['image_url'], candidate)
+                            original_image_path = candidate
+                    if not products and bundle_info.get('individual_products'):
+                        products = list(bundle_info['individual_products'])
+                    if not title and bundle_info.get('title'):
+                        title = bundle_info['title']
+
+                # Download product images from the URLs already extracted above,
+                # concurrently and skipping any that are already cached.
+                async def _fetch(product):
+                    pcode = product.get('code', '')
+                    if not pcode:
+                        return None
+                    img = await crawler.download_product_image(
+                        pcode, product.get('image_url'), uploads_dir,
+                    )
+                    if img:
+                        product['image_path'] = img
+                    return (img, product.get('quantity', 1)) if img else None
+
+                for res in await asyncio.gather(*(_fetch(p) for p in products)):
+                    if res:
+                        product_image_paths.append(res[0])
+                        product_quantities.append(res[1])
+            except Exception as e:  # noqa: BLE001 — crawl failures must not abort the batch
+                logger.warning(f"Crawler failed for {code}: {e}")
+        else:
+            # Use any product image paths already in the bundle data
+            for product in products:
+                if product.get('image_path') and os.path.exists(product['image_path']):
+                    product_image_paths.append(product['image_path'])
+                    product_quantities.append(product.get('quantity', 1))
+
+        product_images_found = len(product_image_paths) > 0
+
+        # Step 2: Assess quality of the current bundle image (PIL work off the loop)
+        if original_image_path and os.path.exists(original_image_path):
+            quality = await asyncio.to_thread(
+                self.assess_quality, original_image_path, product_image_paths,
+            )
+        else:
+            quality = {
+                'score': 0.0,
+                'issues': ['No original bundle image available'],
+                'needs_regeneration': True,
+            }
+
+        # Step 3: Determine arrangement
+        arrangement = self.determine_arrangement(products)
+
+        # Step 4: Determine if we can compose
+        can_compose = (
+            product_images_found and
+            not arrangement['manual_review'] and
+            arrangement['single_image']
+        )
+
+        # Step 5: Categorize
+        category = self.categorize_bundle(
+            bundle=bundle,
+            quality_assessment=quality,
+            product_images_found=product_images_found,
+            can_compose=can_compose,
+        )
+
+        # Step 6: Generate composed image if needed and possible (PIL off the loop)
+        generated_image_path = None
+        if category == 'ready' and can_compose and composer:
+            try:
+                generated_image_path = os.path.join(uploads_dir, f"{code}_generated.jpg")
+                await asyncio.to_thread(
+                    composer.compose_bundle_image,
+                    product_image_paths,
+                    generated_image_path,
+                    product_quantities,
+                )
+                logger.info(f"Generated composed image for {code}")
+            except Exception:
+                logger.exception(f"Failed to generate image for {code}")
+                # Fall back to manual review if composition fails
+                category = 'manual'
+                generated_image_path = None
+
+        # Step 7: Build result
+        return {
+            'code': code,
+            'title': title,
+            'category': category,
+            'original_image': original_image_path,
+            'generated_image': generated_image_path,
+            'products': products,
+            'quality_score': quality['score'],
+            'quality_issues': quality['issues'],
+            'arrangement_reasoning': arrangement['reasoning'],
+        }
 
     def _check_background_whiteness(self, img: Image.Image) -> float:
         """

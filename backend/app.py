@@ -104,6 +104,7 @@ _bundle_load: dict = {
     "finished_at": None,
 }
 _bundle_task = None
+_crawler = None  # shared BootsCrawler (pooled HTTP client), created lazily
 
 # ---------------------------------------------------------------------------
 # Initialize FastAPI app
@@ -165,8 +166,11 @@ def get_monday_client() -> MondayClient:
 
 
 def get_crawler() -> BootsCrawler:
-    """Create a BootsCrawler instance."""
-    return BootsCrawler(x_agent_client=BOOTS_X_AGENT_CLIENT)
+    """Return the shared BootsCrawler (one pooled HTTP client, reused across loads)."""
+    global _crawler
+    if _crawler is None:
+        _crawler = BootsCrawler(x_agent_client=BOOTS_X_AGENT_CLIENT)
+    return _crawler
 
 
 def get_composer() -> ImageComposer:
@@ -676,6 +680,15 @@ async def startup_event():
     logger.info(f"  Monday API token: {'configured' if MONDAY_API_TOKEN else 'NOT SET'}")
     logger.info(f"  CORS origins: {CORS_ORIGINS}")
     logger.info("=" * 60)
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Close the shared crawler's pooled HTTP client on shutdown."""
+    global _crawler
+    if _crawler is not None:
+        await _crawler.close()
+        _crawler = None
 
 
 # ---------------------------------------------------------------------------
