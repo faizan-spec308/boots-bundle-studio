@@ -169,7 +169,7 @@ def get_crawler() -> BootsCrawler:
     """Return the shared BootsCrawler (one pooled HTTP client, reused across loads)."""
     global _crawler
     if _crawler is None:
-        _crawler = BootsCrawler(x_agent_client=BOOTS_X_AGENT_CLIENT)
+        _crawler = BootsCrawler(x_agent_client=BOOTS_X_AGENT_CLIENT, cache_dir=ORIGINALS_DIR)
     return _crawler
 
 
