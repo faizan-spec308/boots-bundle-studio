@@ -330,7 +330,9 @@ class MondayClient:
         wb.close()
         return live_codes
 
-    async def get_confirmed_live_bundles(self, refresh: bool = True, originals_dir: str = "./originals") -> list:
+    async def get_confirmed_live_bundles(
+        self, refresh: bool = True, originals_dir: str = "./originals", phase_cb=None,
+    ) -> list:
         """
         Complete pipeline: fetch both files, identify Virtual Bundles,
         cross-reference against 2am Report, return confirmed-live bundles.
@@ -338,19 +340,29 @@ class MondayClient:
         The Core Line List is ~40MB, so the files are cached on disk and only
         re-downloaded when `refresh` is True or they are missing. Parsing (CPU-heavy
         openpyxl work) runs in a worker thread so it never blocks the event loop.
+        `phase_cb(str)`, if given, is called with a human-readable phase label.
         """
+        def phase(msg: str) -> None:
+            if phase_cb:
+                phase_cb(msg)
+
         core_path = os.path.join(originals_dir, "core_line_list.xlsx")
         report_path = os.path.join(originals_dir, "2am_report.xlsx")
 
         # Download only when asked to refresh or when the cached files are missing
         if refresh or not os.path.exists(core_path):
+            phase("Downloading Core Line List (~40MB) from Monday.com…")
             await self.fetch_core_line_list(core_path)
         if refresh or not os.path.exists(report_path):
+            phase("Downloading 2am report from Monday.com…")
             await self.fetch_2am_report(report_path)
 
         # Parse off the event loop (these block on large spreadsheets)
+        phase("Parsing Core Line List…")
         virtual_bundles = await asyncio.to_thread(self.parse_core_line_list, core_path)
+        phase("Parsing 2am report…")
         live_codes = await asyncio.to_thread(self.parse_2am_report, report_path)
+        phase("Cross-referencing live bundles…")
 
         # Cross-reference: a bundle is live if its Article Number (match_code)
         # appears in the 2am report's BTC codes.

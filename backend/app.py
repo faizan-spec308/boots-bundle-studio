@@ -282,11 +282,37 @@ async def _load_bundles_job(refresh: bool, limit: int) -> None:
         composer = get_composer()
         processor = get_processor()
 
-        _bundle_load["phase"] = "Fetching data from Monday.com"
-        logger.info("Fetching bundles from Monday.com...")
-        confirmed = await monday.get_confirmed_live_bundles(
-            refresh=refresh, originals_dir=ORIGINALS_DIR
-        )
+        # The download + parse of the 40MB Core Line List is expensive, so cache
+        # the computed confirmed-live list; only recompute on refresh or when stale.
+        cache_path = os.path.join(ORIGINALS_DIR, "confirmed_live.json")
+        cache_ttl = int(os.getenv("CONFIRMED_CACHE_TTL", "21600"))  # 6 hours
+        confirmed = None
+        if not refresh and os.path.exists(cache_path):
+            age = time.time() - os.path.getmtime(cache_path)
+            if age < cache_ttl:
+                _bundle_load["phase"] = "Loading cached bundle list…"
+                try:
+                    with open(cache_path) as f:  # noqa: ASYNC230 — small cache read
+                        confirmed = json.load(f)
+                    logger.info(f"Loaded {len(confirmed)} confirmed-live bundles from cache ({age:.0f}s old)")
+                except (json.JSONDecodeError, OSError):
+                    confirmed = None
+
+        if confirmed is None:
+            logger.info("Fetching bundles from Monday.com...")
+
+            def _phase(msg: str) -> None:
+                _bundle_load["phase"] = msg
+
+            confirmed = await monday.get_confirmed_live_bundles(
+                refresh=refresh, originals_dir=ORIGINALS_DIR, phase_cb=_phase,
+            )
+            try:
+                with open(cache_path, "w") as f:  # noqa: ASYNC230 — small cache write
+                    json.dump(confirmed, f)
+            except OSError as e:
+                logger.warning(f"Could not cache confirmed-live list: {e}")
+
         _bundle_load["live_total"] = len(confirmed)
         batch = confirmed[:limit]
         _bundle_load.update(
