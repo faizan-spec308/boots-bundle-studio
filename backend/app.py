@@ -29,10 +29,12 @@ Run on Render:
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import logging
 import os
+import time
 import zipfile
 
 from dotenv import load_dotenv
@@ -64,8 +66,10 @@ logger = logging.getLogger(__name__)
 
 # Directories
 UPLOADS_DIR = os.getenv("UPLOADS_DIR", "uploads")
+ORIGINALS_DIR = os.getenv("ORIGINALS_DIR", "originals")  # cached Monday spreadsheets
 ROUNDEL_PATH = os.path.join(os.path.dirname(__file__), "roundel.png")
 os.makedirs(UPLOADS_DIR, exist_ok=True)
+os.makedirs(ORIGINALS_DIR, exist_ok=True)
 
 # File-backed store so approvals survive process restarts (the in-memory dict
 # alone is lost whenever Render restarts/sleeps the service).
@@ -85,6 +89,21 @@ CORS_ALLOW_CREDENTIALS = CORS_ORIGINS != ["*"]
 # In production, this could be replaced with a database or file-based store
 approved_bundles: dict[str, dict] = {}  # code -> {code, title, image_path, approved_at}
 bundle_data_cache: list[dict] = []  # Cache of last fetched bundle data
+
+# Background bundle-load state. The Monday download + parse + Boots.com crawl is
+# slow, so it runs in a background task and /api/bundles reports progress instead
+# of blocking the (single-worker) server — which would also stall /healthz.
+_bundle_load: dict = {
+    "status": "idle",       # idle | loading | ready | error
+    "phase": "",
+    "processed": 0,
+    "total": 0,             # bundles being processed this run
+    "live_total": 0,        # total confirmed-live bundles found
+    "error": None,
+    "started_at": None,
+    "finished_at": None,
+}
+_bundle_task = None
 
 # ---------------------------------------------------------------------------
 # Initialize FastAPI app
@@ -236,6 +255,68 @@ async def readyz():
 DEFAULT_BUNDLE_LIMIT = int(os.getenv("BUNDLE_PROCESS_LIMIT", "24"))
 
 
+def _bundles_payload() -> dict:
+    """Build the /api/bundles response from the current load state."""
+    s = _bundle_load
+    elapsed = round(time.time() - s["started_at"], 1) if s["started_at"] else 0
+    ready = s["status"] == "ready"
+    return {
+        "status": s["status"],
+        "phase": s["phase"],
+        "processed": s["processed"],
+        "total": s["total"],
+        "live_total": s["live_total"],
+        "elapsed_seconds": elapsed,
+        "error": s["error"],
+        "bundles": bundle_data_cache if ready else [],
+        "count": len(bundle_data_cache) if ready else 0,
+    }
+
+
+async def _load_bundles_job(refresh: bool, limit: int) -> None:
+    """Background job: fetch from Monday, crawl Boots.com, process, cache results."""
+    global bundle_data_cache
+    try:
+        monday = get_monday_client()
+        crawler = get_crawler()
+        composer = get_composer()
+        processor = get_processor()
+
+        _bundle_load["phase"] = "Fetching data from Monday.com"
+        logger.info("Fetching bundles from Monday.com...")
+        confirmed = await monday.get_confirmed_live_bundles(
+            refresh=refresh, originals_dir=ORIGINALS_DIR
+        )
+        _bundle_load["live_total"] = len(confirmed)
+        batch = confirmed[:limit]
+        _bundle_load.update(
+            phase="Crawling Boots.com & composing images",
+            total=len(batch),
+            processed=0,
+        )
+        logger.info(f"Found {len(confirmed)} confirmed live bundles (processing {len(batch)})")
+
+        def _cb(done: int, _total: int) -> None:
+            _bundle_load["processed"] = done
+
+        results = await processor.process_bundles(
+            bundles=batch,
+            crawler=crawler,
+            composer=composer,
+            uploads_dir=UPLOADS_DIR,
+            progress_cb=_cb,
+        )
+        bundle_data_cache = results
+        _bundle_load.update(
+            status="ready", phase="Done", processed=len(results), finished_at=time.time()
+        )
+        logger.info(f"Bundle load complete: {len(results)} of {len(confirmed)} live")
+    except Exception as e:
+        detail = getattr(e, "detail", None) or str(e)
+        logger.exception("Bundle load failed")
+        _bundle_load.update(status="error", error=detail, finished_at=time.time())
+
+
 @app.get("/api/bundles")
 async def get_bundles(
     refresh: bool = Query(False, description="Force re-fetch from Monday.com"),
@@ -245,54 +326,31 @@ async def get_bundles(
     ),
 ):
     """
-    Fetch confirmed-live bundles from Monday.com, crawl Boots.com for images,
-    assess quality, categorize, and return structured data for the frontend.
+    Return confirmed-live bundles, loading them in the background.
 
-    Crawling is network-heavy, so only `limit` bundles are processed per request
-    (there can be thousands of confirmed-live bundles). `total` reports how many
-    confirmed-live bundles exist in all.
-
-    Args:
-        refresh: If True, force re-fetch even if cached data exists.
-        limit: Max number of bundles to crawl/process this request.
+    Because the load is slow (large Monday files + Boots.com crawl), this endpoint
+    never blocks: it kicks off a background job and reports progress. Poll it until
+    `status` is `"ready"`, then `bundles` is populated. Pass `refresh=true` to force
+    a fresh load. `live_total` is the total number of confirmed-live bundles; only
+    `limit` are crawled/processed per run.
     """
-    global bundle_data_cache
+    global _bundle_task
 
-    if bundle_data_cache and not refresh:
-        logger.info("Returning cached bundle data")
-        return {"bundles": bundle_data_cache, "count": len(bundle_data_cache)}
+    # Serve cached results immediately unless a refresh is requested.
+    if _bundle_load["status"] == "ready" and bundle_data_cache and not refresh:
+        return _bundles_payload()
 
-    try:
-        monday = get_monday_client()
-        crawler = get_crawler()
-        composer = get_composer()
-        processor = get_processor()
+    # A load already running: just report progress (don't start another).
+    if _bundle_load["status"] == "loading":
+        return _bundles_payload()
 
-        # Step 1: Fetch confirmed live bundles from Monday.com
-        logger.info("Fetching bundles from Monday.com...")
-        bundles = await monday.get_confirmed_live_bundles()
-        total = len(bundles)
-        logger.info(f"Found {total} confirmed live bundles (processing up to {limit})")
-
-        # Step 2: Process a bounded batch (quality assessment + categorization + generation)
-        logger.info("Processing bundles...")
-        results = await processor.process_bundles(
-            bundles=bundles[:limit],
-            crawler=crawler,
-            composer=composer,
-            uploads_dir=UPLOADS_DIR,
-        )
-
-        # Step 3: Cache results
-        bundle_data_cache = results
-        logger.info(f"Returning {len(results)} processed bundles (of {total} live)")
-        return {"bundles": results, "count": len(results), "total": total}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("Failed to fetch bundles")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch bundles: {e!s}")
+    # Start a new background load (first load, retry after error, or explicit refresh).
+    _bundle_load.update(
+        status="loading", phase="Starting…", processed=0, total=0,
+        error=None, started_at=time.time(), finished_at=None,
+    )
+    _bundle_task = asyncio.create_task(_load_bundles_job(refresh=refresh, limit=limit))
+    return _bundles_payload()
 
 
 @app.get("/api/bundle/{code}")

@@ -240,6 +240,7 @@ class BundleProcessor:
         crawler=None,
         composer=None,
         uploads_dir: str = "uploads",
+        progress_cb=None,
     ) -> list[dict]:
         """
         Full pipeline: assess quality, crawl for product images, categorize, and
@@ -375,6 +376,8 @@ class BundleProcessor:
                 'arrangement_reasoning': arrangement['reasoning'],
             }
             results.append(result)
+            if progress_cb:
+                progress_cb(len(results), len(bundles))
 
         logger.info(f"Processed {len(results)} bundles: "
                      f"{sum(1 for r in results if r['category'] == 'ready')} ready, "

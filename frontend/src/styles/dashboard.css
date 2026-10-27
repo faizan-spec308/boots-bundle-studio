@@ -230,6 +230,41 @@ body {
   to { transform: rotate(360deg); }
 }
 
+/* Load progress */
+.progress-wrap {
+  width: 100%;
+  max-width: 420px;
+  margin-top: 8px;
+}
+
+.progress-bar {
+  width: 100%;
+  height: 8px;
+  background: var(--gray-200);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: var(--boots-blue);
+  border-radius: 999px;
+  transition: width 0.4s ease;
+}
+
+.progress-text {
+  margin-top: 10px;
+  font-size: 0.9rem;
+  color: var(--gray-700);
+  text-align: center;
+}
+
+.progress-elapsed {
+  margin-top: 4px;
+  font-size: 0.8rem;
+  color: var(--gray-500);
+}
+
 /* Error Banner */
 .error-banner {
   background: #fee;

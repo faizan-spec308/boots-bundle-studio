@@ -7,6 +7,7 @@ identifies Virtual Bundle lines, and cross-references for live status.
 
 from __future__ import annotations
 
+import asyncio
 import os
 
 import httpx
@@ -329,21 +330,27 @@ class MondayClient:
         wb.close()
         return live_codes
 
-    async def get_confirmed_live_bundles(self) -> list:
+    async def get_confirmed_live_bundles(self, refresh: bool = True, originals_dir: str = "./originals") -> list:
         """
         Complete pipeline: fetch both files, identify Virtual Bundles,
         cross-reference against 2am Report, return confirmed-live bundles.
+
+        The Core Line List is ~40MB, so the files are cached on disk and only
+        re-downloaded when `refresh` is True or they are missing. Parsing (CPU-heavy
+        openpyxl work) runs in a worker thread so it never blocks the event loop.
         """
-        core_path = "./originals/core_line_list.xlsx"
-        report_path = "./originals/2am_report.xlsx"
+        core_path = os.path.join(originals_dir, "core_line_list.xlsx")
+        report_path = os.path.join(originals_dir, "2am_report.xlsx")
 
-        # Download both files fresh
-        await self.fetch_core_line_list(core_path)
-        await self.fetch_2am_report(report_path)
+        # Download only when asked to refresh or when the cached files are missing
+        if refresh or not os.path.exists(core_path):
+            await self.fetch_core_line_list(core_path)
+        if refresh or not os.path.exists(report_path):
+            await self.fetch_2am_report(report_path)
 
-        # Parse
-        virtual_bundles = self.parse_core_line_list(core_path)
-        live_codes = self.parse_2am_report(report_path)
+        # Parse off the event loop (these block on large spreadsheets)
+        virtual_bundles = await asyncio.to_thread(self.parse_core_line_list, core_path)
+        live_codes = await asyncio.to_thread(self.parse_2am_report, report_path)
 
         # Cross-reference: a bundle is live if its Article Number (match_code)
         # appears in the 2am report's BTC codes.
