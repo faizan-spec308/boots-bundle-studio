@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: boots-bundle-studio-api
+    runtime: python
+    region: frankfurt
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    autoDeployTrigger: 'off'
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: MONDAY_API_TOKEN
+        sync: false
+      - key: MONDAY_BOARD_ID
+        value: "5100428483"
+      - key: BOOTS_X_AGENT_CLIENT
+        value: "W-7njoVr89mFAk"
+      - key: CORS_ORIGINS
+        sync: false
+      - key: UPLOADS_DIR
+        value: "uploads"
