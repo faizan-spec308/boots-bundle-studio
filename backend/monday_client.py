@@ -194,7 +194,11 @@ class MondayClient:
         xlsx_asset = None
         for update in reversed(updates):
             for asset in update.get("assets", []):
-                if asset.get("file_extension", "").lower() in ("xlsx", "xls"):
+                # Monday returns file_extension with a leading dot (e.g. ".xlsx");
+                # normalise it and also fall back to the asset's filename.
+                ext = (asset.get("file_extension") or "").lower().lstrip(".")
+                name = (asset.get("name") or "").lower()
+                if ext in ("xlsx", "xls") or name.endswith((".xlsx", ".xls")):
                     xlsx_asset = asset
                     break
             if xlsx_asset:
@@ -203,10 +207,12 @@ class MondayClient:
         if not xlsx_asset:
             raise ValueError("No .xlsx asset found in 2am report updates")
 
-        # Download using the asset URL
-        asset_url = xlsx_asset.get("url")
+        # The asset's own `url` is a protected monday.com link that needs a login
+        # session (returns 406). Resolve the public, pre-signed URL instead, the
+        # same way fetch_core_line_list does.
+        asset_url = await self.get_asset_url(xlsx_asset["id"])
         if not asset_url:
-            asset_url = await self.get_asset_url(xlsx_asset["id"])
+            asset_url = xlsx_asset.get("url")
 
         if not asset_url:
             raise ValueError("Could not get download URL for 2am report asset")
@@ -215,45 +221,71 @@ class MondayClient:
         return save_path
 
     @staticmethod
+    def _norm_code(value) -> str:
+        """Normalise a code cell to a comparable string (handles int/float cells)."""
+        if value is None:
+            return ""
+        s = str(value).strip()
+        return s.removesuffix(".0")  # numeric codes often arrive as floats
+
+    @staticmethod
+    def _find_col(headers: list, *candidates: str) -> int | None:
+        """Find a column index by case-insensitive exact header match first, then
+        by substring, trying each candidate name in order."""
+        norm = [str(h).lower().strip() if h else "" for h in headers]
+        for cand in candidates:
+            c = cand.lower()
+            for i, h in enumerate(norm):
+                if h == c:
+                    return i
+        for cand in candidates:
+            c = cand.lower()
+            for i, h in enumerate(norm):
+                if h and c in h:
+                    return i
+        return None
+
+    @staticmethod
     def parse_core_line_list(file_path: str) -> list:
         """
         Parse the Commercial Core Line List Excel file.
-        Returns a list of Virtual Bundle lines with product details.
+        Returns Virtual Bundle lines. Each has:
+          - code:       Boots.com Article Number (8-digit; used to crawl + export)
+          - match_code: Article Number (used to cross-reference the 2am report)
+          - title/name, brand, article_type
         """
         wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
         ws = wb.active
 
-        # Find the header row
         headers = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
-        header_map = {}
-        for i, h in enumerate(headers):
-            if h:
-                h_lower = str(h).lower().strip()
-                if "article" in h_lower and "type" in h_lower:
-                    header_map["article_type"] = i
-                elif "article" in h_lower and "number" in h_lower or "sap" in h_lower or "product" in h_lower and "code" in h_lower:
-                    header_map["product_code"] = i
-                elif "product" in h_lower and "name" in h_lower or "description" in h_lower:
-                    header_map["product_name"] = i
-                elif "brand" in h_lower:
-                    header_map["brand"] = i
+        c_type = MondayClient._find_col(headers, "Boots.com Article Type", "Article Type")
+        c_code = MondayClient._find_col(headers, "Boots.com Article Number", "Boots.com Article")
+        c_match = MondayClient._find_col(headers, "Article Number")
+        c_name = MondayClient._find_col(headers, "Full Article Description", "Article Description", "Description")
+        c_brand = MondayClient._find_col(headers, "Brand Link", "Brand")
 
-        if "article_type" not in header_map:
-            raise ValueError("Could not find 'Article Type' column in Core Line List")
+        if c_type is None:
+            raise ValueError("Could not find an 'Article Type' column in Core Line List")
 
-        # Collect Virtual Bundle lines
+        def cell(row, idx):
+            return row[idx] if idx is not None and idx < len(row) else None
+
         virtual_bundles = []
         for row in ws.iter_rows(min_row=2, values_only=True):
-            article_type = row[header_map["article_type"]] if header_map["article_type"] < len(row) else None
-            if article_type and "virtual bundle" in str(article_type).lower():
-                bundle = {
-                    "code": str(row[header_map["product_code"]]) if "product_code" in header_map and header_map["product_code"] < len(row) else "",
-                    "name": str(row[header_map["product_name"]]) if "product_name" in header_map and header_map["product_name"] < len(row) else "",
-                    "brand": str(row[header_map["brand"]]) if "brand" in header_map and header_map["brand"] < len(row) else "",
-                    "article_type": "Virtual Bundle",
-                }
-                if bundle["code"]:
-                    virtual_bundles.append(bundle)
+            article_type = cell(row, c_type)
+            if not (article_type and "virtual bundle" in str(article_type).lower()):
+                continue
+            name = str(cell(row, c_name) or "").strip()
+            bundle = {
+                "code": MondayClient._norm_code(cell(row, c_code)),
+                "match_code": MondayClient._norm_code(cell(row, c_match)),
+                "title": name,
+                "name": name,
+                "brand": str(cell(row, c_brand) or "").strip(),
+                "article_type": "Virtual Bundle",
+            }
+            if bundle["code"]:
+                virtual_bundles.append(bundle)
 
         wb.close()
         return virtual_bundles
@@ -262,30 +294,37 @@ class MondayClient:
     def parse_2am_report(file_path: str) -> set:
         """
         Parse the 2am Report Excel file.
-        Returns a set of product codes that are currently live on Boots.com.
+        The header is not on row 1 (the first rows hold a title + blanks), so it is
+        detected dynamically. Returns the set of live 'BTC Code' values, which match
+        the Core Line List's 'Article Number'.
         """
         wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
         ws = wb.active
 
-        # Find the header row and the column with product codes
-        headers = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
-        code_col = None
-        for i, h in enumerate(headers):
-            if h:
-                h_lower = str(h).lower().strip()
-                if "article" in h_lower and "number" in h_lower or "sap" in h_lower or "product" in h_lower and "code" in h_lower or "sku" in h_lower:
-                    code_col = i
-                    break
+        # Detect the header row within the first ~15 rows.
+        header_row = None
+        headers = None
+        for idx, row in enumerate(ws.iter_rows(min_row=1, max_row=15, values_only=True), start=1):
+            cells = [str(c).lower() for c in row if c]
+            if any("btc code" in c or "sap code" in c for c in cells):
+                header_row = idx
+                headers = list(row)
+                break
 
+        if header_row is None:
+            wb.close()
+            raise ValueError("Could not find the header row in the 2am report")
+
+        code_col = MondayClient._find_col(headers, "BTC Code", "Boots.com", "Code")
         if code_col is None:
-            # Try first column as fallback
-            code_col = 0
+            wb.close()
+            raise ValueError("Could not find a code column in the 2am report")
 
         live_codes = set()
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            code = row[code_col] if code_col < len(row) else None
+        for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
+            code = MondayClient._norm_code(row[code_col] if code_col < len(row) else None)
             if code:
-                live_codes.add(str(code).strip())
+                live_codes.add(code)
 
         wb.close()
         return live_codes
@@ -306,10 +345,11 @@ class MondayClient:
         virtual_bundles = self.parse_core_line_list(core_path)
         live_codes = self.parse_2am_report(report_path)
 
-        # Cross-reference
+        # Cross-reference: a bundle is live if its Article Number (match_code)
+        # appears in the 2am report's BTC codes.
         confirmed_live = []
         for bundle in virtual_bundles:
-            if bundle["code"] in live_codes:
+            if bundle.get("match_code") and bundle["match_code"] in live_codes:
                 bundle["live"] = True
                 confirmed_live.append(bundle)
 

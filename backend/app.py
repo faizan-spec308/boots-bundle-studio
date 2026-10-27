@@ -233,14 +233,28 @@ async def readyz():
 # Main API endpoints
 # ---------------------------------------------------------------------------
 
+DEFAULT_BUNDLE_LIMIT = int(os.getenv("BUNDLE_PROCESS_LIMIT", "24"))
+
+
 @app.get("/api/bundles")
-async def get_bundles(refresh: bool = Query(False, description="Force re-fetch from Monday.com")):
+async def get_bundles(
+    refresh: bool = Query(False, description="Force re-fetch from Monday.com"),
+    limit: int = Query(
+        DEFAULT_BUNDLE_LIMIT, ge=1, le=500,
+        description="Max confirmed-live bundles to crawl/process per request",
+    ),
+):
     """
-    Fetch all bundles from Monday.com, crawl Boots.com for images,
+    Fetch confirmed-live bundles from Monday.com, crawl Boots.com for images,
     assess quality, categorize, and return structured data for the frontend.
+
+    Crawling is network-heavy, so only `limit` bundles are processed per request
+    (there can be thousands of confirmed-live bundles). `total` reports how many
+    confirmed-live bundles exist in all.
 
     Args:
         refresh: If True, force re-fetch even if cached data exists.
+        limit: Max number of bundles to crawl/process this request.
     """
     global bundle_data_cache
 
@@ -257,12 +271,13 @@ async def get_bundles(refresh: bool = Query(False, description="Force re-fetch f
         # Step 1: Fetch confirmed live bundles from Monday.com
         logger.info("Fetching bundles from Monday.com...")
         bundles = await monday.get_confirmed_live_bundles()
-        logger.info(f"Found {len(bundles)} confirmed live bundles")
+        total = len(bundles)
+        logger.info(f"Found {total} confirmed live bundles (processing up to {limit})")
 
-        # Step 2: Process all bundles (quality assessment + categorization + generation)
+        # Step 2: Process a bounded batch (quality assessment + categorization + generation)
         logger.info("Processing bundles...")
         results = await processor.process_bundles(
-            bundles=bundles,
+            bundles=bundles[:limit],
             crawler=crawler,
             composer=composer,
             uploads_dir=UPLOADS_DIR,
@@ -270,8 +285,8 @@ async def get_bundles(refresh: bool = Query(False, description="Force re-fetch f
 
         # Step 3: Cache results
         bundle_data_cache = results
-        logger.info(f"Returning {len(results)} processed bundles")
-        return {"bundles": results, "count": len(results)}
+        logger.info(f"Returning {len(results)} processed bundles (of {total} live)")
+        return {"bundles": results, "count": len(results), "total": total}
 
     except HTTPException:
         raise
