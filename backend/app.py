@@ -275,10 +275,23 @@ async def readyz():
 # Main API endpoints
 # ---------------------------------------------------------------------------
 
-DEFAULT_BUNDLE_LIMIT = int(os.getenv("BUNDLE_PROCESS_LIMIT", "24"))
+DEFAULT_BUNDLE_LIMIT = int(os.getenv("BUNDLE_PROCESS_LIMIT", "7"))
 # Testing toggle: skip the Monday.com download and parse the local files in
 # ORIGINALS_DIR instead (also bypasses the confirmed-live cache so parsing runs).
 USE_LOCAL_FILES = os.getenv("USE_LOCAL_FILES", "").strip().lower() in ("1", "true", "yes")
+
+# A fixed demo/test set. When set (the default), /api/bundles uses these codes
+# directly and skips Monday.com entirely (no 45MB download or parse) — the WCS
+# crawler supplies each bundle's title, components, and quantities from the code.
+# Set TEST_BUNDLE_CODES="" (empty) to use the real Monday.com confirmed-live list.
+_DEFAULT_TEST_CODES = (
+    "10359241,10397935,10372752,10397449,"  # need regeneration (number badges)
+    "10261022,10348931,10346368"            # already fine (shown as-is)
+)
+TEST_BUNDLE_CODES = [
+    c.strip() for c in os.getenv("TEST_BUNDLE_CODES", _DEFAULT_TEST_CODES).split(",") if c.strip()
+]
+BUNDLE_CACHE_TTL = int(os.getenv("BUNDLE_CACHE_TTL", "3600"))  # processed-results cache (1h)
 
 
 def _bundles_payload() -> dict:
@@ -299,71 +312,85 @@ def _bundles_payload() -> dict:
     }
 
 
-async def _load_bundles_job(refresh: bool, limit: int) -> None:
-    """Background job: fetch from Monday, crawl Boots.com, process, cache results."""
+async def _confirmed_live(refresh: bool) -> list:
+    """Return the confirmed-live bundle list to process.
+
+    Default/demo path: use the fixed TEST_BUNDLE_CODES directly and skip Monday.com
+    entirely (no 45MB download or parse) — the crawler fills in title/components.
+    When refresh=True, or TEST_BUNDLE_CODES is empty, fetch the real list from
+    Monday.com (local files are reused unless refresh forces a download).
+    """
+    if TEST_BUNDLE_CODES and not refresh:
+        _bundle_load["phase"] = "Loading test bundles…"
+        return [{"code": c, "title": "", "products": []} for c in TEST_BUNDLE_CODES]
+
+    def _phase(msg: str) -> None:
+        _bundle_load["phase"] = msg
+
+    monday = get_monday_client()
+    return await monday.get_confirmed_live_bundles(
+        refresh=refresh, originals_dir=ORIGINALS_DIR, phase_cb=_phase,
+        use_local_files=USE_LOCAL_FILES,
+    )
+
+
+async def _load_bundles_job(refresh: bool, limit: int, force: bool) -> None:
+    """Background job: resolve bundles, crawl Boots.com, compose, cache results."""
     global bundle_data_cache
+    cache_path = os.path.join(UPLOADS_DIR, "_bundle_cache.json")
     try:
-        monday = get_monday_client()
+        # 1) Serve the processed-results cache for instant repeat loads (unless
+        #    a refresh or force bypass is requested).
+        if not force and not refresh and os.path.exists(cache_path):
+            age = time.time() - os.path.getmtime(cache_path)
+            if age < BUNDLE_CACHE_TTL:
+                try:
+                    with open(cache_path) as f:  # noqa: ASYNC230 — small cache read
+                        cached = json.load(f)
+                    bundle_data_cache = cached.get("bundles", [])
+                    _bundle_load.update(
+                        status="ready", phase="Done",
+                        live_total=cached.get("live_total", len(bundle_data_cache)),
+                        processed=len(bundle_data_cache), total=len(bundle_data_cache),
+                        finished_at=time.time(),
+                    )
+                    logger.info(f"Served {len(bundle_data_cache)} bundles from cache ({age:.0f}s old)")
+                    return
+                except (json.JSONDecodeError, OSError):
+                    pass
+
         crawler = get_crawler()
         composer = get_composer()
         processor = get_processor()
 
-        # The download + parse of the 40MB Core Line List is expensive, so cache
-        # the computed confirmed-live list; only recompute on refresh or when stale.
-        cache_path = os.path.join(ORIGINALS_DIR, "confirmed_live.json")
-        cache_ttl = int(os.getenv("CONFIRMED_CACHE_TTL", "21600"))  # 6 hours
-        confirmed = None
-        if not refresh and not USE_LOCAL_FILES and os.path.exists(cache_path):
-            age = time.time() - os.path.getmtime(cache_path)
-            if age < cache_ttl:
-                _bundle_load["phase"] = "Loading cached bundle list…"
-                try:
-                    with open(cache_path) as f:  # noqa: ASYNC230 — small cache read
-                        confirmed = json.load(f)
-                    logger.info(f"Loaded {len(confirmed)} confirmed-live bundles from cache ({age:.0f}s old)")
-                except (json.JSONDecodeError, OSError):
-                    confirmed = None
-
-        if confirmed is None:
-            logger.info("Fetching bundles from Monday.com...")
-
-            def _phase(msg: str) -> None:
-                _bundle_load["phase"] = msg
-
-            confirmed = await monday.get_confirmed_live_bundles(
-                refresh=refresh, originals_dir=ORIGINALS_DIR, phase_cb=_phase,
-                use_local_files=USE_LOCAL_FILES,
-            )
-            try:
-                with open(cache_path, "w") as f:  # noqa: ASYNC230 — small cache write
-                    json.dump(confirmed, f)
-            except OSError as e:
-                logger.warning(f"Could not cache confirmed-live list: {e}")
-
+        # 2) Resolve the bundle set (test codes by default — no Monday download)
+        confirmed = await _confirmed_live(refresh)
         _bundle_load["live_total"] = len(confirmed)
         batch = confirmed[:limit]
         _bundle_load.update(
-            phase="Crawling Boots.com & composing images",
-            total=len(batch),
-            processed=0,
+            phase="Crawling Boots.com & composing images", total=len(batch), processed=0,
         )
-        logger.info(f"Found {len(confirmed)} confirmed live bundles (processing {len(batch)})")
+        logger.info(f"Resolved {len(confirmed)} bundles (processing {len(batch)})")
 
         def _cb(done: int, _total: int) -> None:
             _bundle_load["processed"] = done
 
+        # 3) Process + cache the results
         results = await processor.process_bundles(
-            bundles=batch,
-            crawler=crawler,
-            composer=composer,
-            uploads_dir=UPLOADS_DIR,
-            progress_cb=_cb,
+            bundles=batch, crawler=crawler, composer=composer,
+            uploads_dir=UPLOADS_DIR, progress_cb=_cb,
         )
         bundle_data_cache = results
+        try:
+            with open(cache_path, "w") as f:  # noqa: ASYNC230 — small cache write
+                json.dump({"bundles": results, "live_total": len(confirmed)}, f)
+        except OSError as e:
+            logger.warning(f"Could not write bundle cache: {e}")
+
         _bundle_load.update(
-            status="ready", phase="Done", processed=len(results), finished_at=time.time()
+            status="ready", phase="Done", processed=len(results), finished_at=time.time(),
         )
-        logger.info(f"Bundle load complete: {len(results)} of {len(confirmed)} live")
+        logger.info(f"Bundle load complete: {len(results)} of {len(confirmed)}")
     except Exception as e:
         detail = getattr(e, "detail", None) or str(e)
         logger.exception("Bundle load failed")
@@ -372,37 +399,40 @@ async def _load_bundles_job(refresh: bool, limit: int) -> None:
 
 @app.get("/api/bundles")
 async def get_bundles(
-    refresh: bool = Query(False, description="Force re-fetch from Monday.com"),
+    refresh: bool = Query(False, description="Re-fetch the full list from Monday.com"),
+    force: bool = Query(False, description="Bypass the processed-results cache and reprocess"),
     limit: int = Query(
         DEFAULT_BUNDLE_LIMIT, ge=1, le=500,
-        description="Max confirmed-live bundles to crawl/process per request",
+        description="Max bundles to crawl/process per request",
     ),
 ):
     """
-    Return confirmed-live bundles, loading them in the background.
+    Return bundles, loading them in the background so the request never blocks.
 
-    Because the load is slow (large Monday files + Boots.com crawl), this endpoint
-    never blocks: it kicks off a background job and reports progress. Poll it until
-    `status` is `"ready"`, then `bundles` is populated. Pass `refresh=true` to force
-    a fresh load. `live_total` is the total number of confirmed-live bundles; only
-    `limit` are crawled/processed per run.
+    By default this uses the fixed TEST_BUNDLE_CODES and skips Monday.com entirely,
+    and serves a cached result when one is fresh (<1h) — so loads are near-instant.
+    Poll until `status` is `"ready"`, then `bundles` is populated.
+      - `refresh=true`: re-fetch the real confirmed-live list from Monday.com.
+      - `force=true`: bypass the processed-results cache and reprocess.
     """
     global _bundle_task
 
-    # Serve cached results immediately unless a refresh is requested.
-    if _bundle_load["status"] == "ready" and bundle_data_cache and not refresh:
+    # Serve in-memory cached results immediately (unless refresh/force requested).
+    if _bundle_load["status"] == "ready" and bundle_data_cache and not refresh and not force:
         return _bundles_payload()
 
     # A load already running: just report progress (don't start another).
     if _bundle_load["status"] == "loading":
         return _bundles_payload()
 
-    # Start a new background load (first load, retry after error, or explicit refresh).
+    # Start a new background load (first load, retry after error, refresh, or force).
     _bundle_load.update(
         status="loading", phase="Starting…", processed=0, total=0,
         error=None, started_at=time.time(), finished_at=None,
     )
-    _bundle_task = asyncio.create_task(_load_bundles_job(refresh=refresh, limit=limit))
+    _bundle_task = asyncio.create_task(
+        _load_bundles_job(refresh=refresh, limit=limit, force=force),
+    )
     return _bundles_payload()
 
 
