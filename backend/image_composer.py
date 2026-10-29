@@ -11,7 +11,6 @@ altered product colours, artwork, text, and proportions.
 
 from __future__ import annotations
 
-import math
 import os
 
 from PIL import Image, ImageDraw, ImageFilter
@@ -22,9 +21,9 @@ class ImageComposer:
     BACKGROUND_COLOR = (255, 255, 255)
     MAX_PRODUCT_HEIGHT = 1600  # Max height for each product (leaves room for shadow)
     DEFAULT_GAP = 60  # Default gap between products in pixels
-    SHADOW_OPACITY = 80
-    SHADOW_BLUR = 20
-    SHADOW_HEIGHT = 30
+    SHADOW_OPACITY = 120
+    SHADOW_BLUR = 25
+    SHADOW_HEIGHT = 40
 
     def __init__(self, roundel_path: str | None = None):
         self.roundel_path = roundel_path
@@ -82,40 +81,30 @@ class ImageComposer:
         if not processed_products:
             raise ValueError("No valid product images found")
 
-        # --- Arrange products in a grid that fills the canvas ---
-        # Up to 5 items sit in a single horizontal row (shelf layout, per the
-        # "fewer than 6 identical -> horizontal row" rule); 6+ use a balanced grid
-        # so each product stays large instead of shrinking to fit one row.
-        n = len(processed_products)
-        cols = n if n <= 5 else math.ceil(math.sqrt(n))
-        rows = math.ceil(n / cols)
+        # Trim surrounding whitespace so each product fills its frame, then scale
+        # every product to a common target height (~75% of the canvas) so products
+        # stay large instead of tiny in a sea of white. Fidelity is preserved:
+        # uniform scaling only, exact product pixels — just the white margins removed.
+        trimmed = [self._trim_whitespace(img) for img in processed_products]
+        target_height = min(int(self.CANVAS_SIZE * 0.75), max_height)  # ~1500px
+        resized_products = [self._resize_product(img, target_height) for img in trimmed]
 
-        margin = 120                       # outer margin around the grid
-        cell_gap = max(gap, 50)            # space between grid cells
-        usable = self.CANVAS_SIZE - 2 * margin
-        cell_w = (usable - cell_gap * (cols - 1)) / cols
-        cell_h = (usable - cell_gap * (rows - 1)) / rows
-        product_max_h = min(cell_h * 0.86, max_height)  # leave room for the shadow
+        # Single horizontal row (shelf layout). If the row is wider than the canvas,
+        # scale all products down proportionally so they still fit with padding.
+        total_width = sum(i.width for i in resized_products) + gap * (len(resized_products) - 1)
+        max_total_width = self.CANVAS_SIZE - 200  # 100px padding each side
+        if total_width > max_total_width:
+            scale = max_total_width / total_width
+            resized_products = [
+                i.resize((max(1, int(i.width * scale)), max(1, int(i.height * scale))), Image.LANCZOS)
+                for i in resized_products
+            ]
+            total_width = sum(i.width for i in resized_products) + gap * (len(resized_products) - 1)
 
-        # Scale each product uniformly to fill its cell as much as possible.
-        # Uniform scaling only — no stretching/distortion (product fidelity).
-        scaled = []
-        for img in processed_products:
-            s = min(cell_w / img.width, product_max_h / img.height)
-            scaled.append(img.resize(
-                (max(1, int(img.width * s)), max(1, int(img.height * s))), Image.LANCZOS,
-            ))
-
-        # Centre the whole grid vertically
-        grid_h = rows * cell_h + cell_gap * (rows - 1)
-        grid_top = (self.CANVAS_SIZE - grid_h) / 2
-
-        # Tallest product in each row — used to share a baseline and centre the
-        # row's products vertically (shelf layout) instead of leaving them low.
-        row_max_h = {}
-        for idx, img in enumerate(scaled):
-            r = idx // cols
-            row_max_h[r] = max(row_max_h.get(r, 0), img.height)
+        # Centre the row horizontally, and vertically on a shared baseline.
+        start_x = (self.CANVAS_SIZE - total_width) // 2
+        max_h = max(i.height for i in resized_products)
+        baseline = self.CANVAS_SIZE // 2 + max_h // 2
 
         # Create white canvas + shadow layer
         canvas = Image.new("RGBA", (self.CANVAS_SIZE, self.CANVAS_SIZE), self.BACKGROUND_COLOR + (255,))
@@ -123,25 +112,18 @@ class ImageComposer:
         shadow_draw = ImageDraw.Draw(shadow_layer)
 
         placements = []
-        for idx, img in enumerate(scaled):
-            r = idx // cols
-            col_in_row = idx - r * cols
-            items_in_row = min(cols, n - r * cols)  # last row may be shorter -> centre it
-            row_w = items_in_row * cell_w + cell_gap * (items_in_row - 1)
-            row_left = (self.CANVAS_SIZE - row_w) / 2
-            cell_x = row_left + col_in_row * (cell_w + cell_gap)
-            cell_y = grid_top + r * (cell_h + cell_gap)
-            px = int(cell_x + (cell_w - img.width) / 2)          # centre in cell horizontally
-            # shared baseline per row, placed so the row's products are vertically centred
-            baseline = cell_y + cell_h / 2 + row_max_h[r] / 2
-            py = int(baseline - img.height)
-            placements.append((img, px, py))
-            # contact shadow beneath the product
+        current_x = start_x
+        for img in resized_products:
+            placements.append((img, current_x, baseline - img.height))
+            # contact shadow: an ellipse 20% wider than the product, centred under it
+            shadow_w = int(img.width * 1.2)
+            shadow_x = current_x - (shadow_w - img.width) // 2
             shadow_draw.ellipse(
-                [px, int(baseline) - self.SHADOW_HEIGHT // 2,
-                 px + img.width, int(baseline) + self.SHADOW_HEIGHT // 2],
+                [shadow_x, baseline - self.SHADOW_HEIGHT // 2,
+                 shadow_x + shadow_w, baseline + self.SHADOW_HEIGHT // 2],
                 fill=(0, 0, 0, self.SHADOW_OPACITY),
             )
+            current_x += img.width + gap
 
         # Blur the shadow layer, then paste products on top
         shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=self.SHADOW_BLUR))
@@ -169,27 +151,30 @@ class ImageComposer:
         print(f"Composed bundle image saved to: {output_path}")
         return output_path
 
-    def _resize_product(self, img: Image.Image, max_height: int) -> Image.Image:
-        """Resize a product image to fit within max_height while keeping aspect ratio."""
-        # If the image is already smaller than max_height, don't upscale
-        if img.height <= max_height:  # noqa: SIM102 — nested check kept for clarity
-            # But check if width is too large
-            if img.width <= self.CANVAS_SIZE * 0.4:
-                return img
+    def _resize_product(self, img: Image.Image, target_height: int) -> Image.Image:
+        """Scale a product to the target height, keeping aspect ratio. Always
+        scales (including UP) so products fill the canvas rather than staying at
+        their small download size."""
+        scale = target_height / img.height
+        new_width = max(1, int(img.width * scale))
+        return img.resize((new_width, target_height), Image.LANCZOS)
 
-        # Calculate scale to fit within max_height
-        scale = max_height / img.height
-        new_width = int(img.width * scale)
-        new_height = max_height
-
-        # If the width is still too large, scale by width instead
-        max_width = self.CANVAS_SIZE * 0.4  # Max 40% of canvas per product
-        if new_width > max_width:
-            scale = max_width / img.width
-            new_width = int(img.width * scale)
-            new_height = int(img.height * scale)
-
-        return img.resize((new_width, new_height), Image.LANCZOS)
+    def _trim_whitespace(self, img: Image.Image) -> Image.Image:
+        """Crop the near-white margins around a product so it fills its frame.
+        Only surrounding white background is removed — the product pixels are
+        untouched (fidelity preserved)."""
+        gray = img.convert("RGB").convert("L")
+        # Content = pixels darker than near-white; getbbox returns their bounds.
+        mask = gray.point(lambda v: 255 if v < 250 else 0)
+        bbox = mask.getbbox()
+        if not bbox:
+            return img
+        pad = 8  # small safety margin so product edges are never clipped
+        left = max(0, bbox[0] - pad)
+        top = max(0, bbox[1] - pad)
+        right = min(img.width, bbox[2] + pad)
+        bottom = min(img.height, bbox[3] + pad)
+        return img.crop((left, top, right, bottom))
 
     def edit_bundle_image(
         self,

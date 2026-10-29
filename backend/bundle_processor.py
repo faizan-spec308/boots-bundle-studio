@@ -15,6 +15,8 @@ Applies bundle arrangement rules from the requirements document:
   - If composition can't be determined confidently → Manual Review
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import os
@@ -130,31 +132,33 @@ class BundleProcessor:
         product_images_found: bool,
         can_compose: bool,
         has_original: bool,
-    ) -> str:
+    ) -> tuple[str, bool]:
         """
-        Categorize a bundle into one of three dashboard sections.
+        Categorize a bundle and decide whether a new image is produced.
 
-        - 'ready'    : the original image is already fine (shown as-is), OR it needs
-                       a new image and we can confidently compose one.
-        - 'supplier' : needs a new image but no component product images were found.
-        - 'manual'   : needs a new image but a confident arrangement can't be made.
+        Returns (category, needs_regeneration):
+        - ('ready', False) : the original image is already fine — shown as-is (and
+                             filtered out of the dashboard, since it needs no action).
+        - ('ready', True)  : needs a new image and one can be composed.
+        - ('supplier', ...) : needs an image but no component product images found.
+        - ('manual', ...)   : needs an image but a confident arrangement can't be made.
         """
         code = bundle.get('code', '?')
 
-        # If the original is already good, show it as-is — do NOT regenerate.
+        # Original is already good — no regeneration needed.
         if not needs_regeneration and has_original:
             logger.info(f"Bundle {code}: ready (original is fine, no regeneration)")
-            return 'ready'
+            return ('ready', False)
 
         # From here, the bundle needs a (re)generated image.
         if not product_images_found:
             logger.info(f"Bundle {code}: supplier (needs image, no component images)")
-            return 'supplier'
+            return ('supplier', False)
         if not can_compose:
             logger.info(f"Bundle {code}: manual (needs image, cannot arrange confidently)")
-            return 'manual'
+            return ('manual', False)
         logger.info(f"Bundle {code}: ready (will regenerate)")
-        return 'ready'
+        return ('ready', True)
 
     def determine_arrangement(
         self,
@@ -282,14 +286,17 @@ class BundleProcessor:
 
         await asyncio.gather(*(worker(i, b) for i, b in enumerate(bundles)))
 
-        logger.info(f"Processed {len(results)} bundles: "
+        # Drop bundles that were filtered out (good originals that need no action).
+        results = [r for r in results if r is not None]
+
+        logger.info(f"Returning {len(results)} bundles that need action: "
                      f"{sum(1 for r in results if r['category'] == 'ready')} ready, "
                      f"{sum(1 for r in results if r['category'] == 'supplier')} supplier, "
                      f"{sum(1 for r in results if r['category'] == 'manual')} manual")
 
         return results
 
-    async def _process_one(self, bundle: dict, crawler, composer, uploads_dir: str) -> dict:
+    async def _process_one(self, bundle: dict, crawler, composer, uploads_dir: str) -> dict | None:
         """Crawl, assess, categorize, and (if possible) compose a single bundle."""
         code = bundle.get('code', '')
         title = bundle.get('title', '')
@@ -381,8 +388,8 @@ class BundleProcessor:
         is_multipack_with_badge = len(products) == 1 and total_items >= 2
         needs_regeneration = is_multipack_with_badge or quality['needs_regeneration']
 
-        # Step 6: Categorize
-        category = self.categorize_bundle(
+        # Step 6: Categorize + decide whether a new image is produced
+        category, needs_regeneration = self.categorize_bundle(
             bundle=bundle,
             needs_regeneration=needs_regeneration,
             product_images_found=product_images_found,
@@ -408,7 +415,13 @@ class BundleProcessor:
                 category = 'manual'
                 generated_image_path = None
 
-        # Step 8: Build result
+        # Step 8: Filter — a bundle whose original is already fine needs no action,
+        # so it is excluded from the dashboard entirely.
+        if category == 'ready' and not needs_regeneration:
+            logger.info(f"Bundle {code}: original is good — excluded from dashboard")
+            return None
+
+        # Step 9: Build result (only for bundles that need action)
         return {
             'code': code,
             'title': title,
@@ -419,6 +432,7 @@ class BundleProcessor:
             'quality_score': quality['score'],
             'quality_issues': quality['issues'],
             'arrangement_reasoning': arrangement['reasoning'],
+            'needs_regeneration': needs_regeneration,
         }
 
     def _check_background_whiteness(self, img: Image.Image) -> float:
