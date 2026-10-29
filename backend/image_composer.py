@@ -11,6 +11,7 @@ altered product colours, artwork, text, and proportions.
 
 from __future__ import annotations
 
+import math
 import os
 
 from PIL import Image, ImageDraw, ImageFilter
@@ -81,58 +82,63 @@ class ImageComposer:
         if not processed_products:
             raise ValueError("No valid product images found")
 
-        # Resize each product to fit within max_height while keeping aspect ratio
-        resized_products = []
+        # --- Arrange products in a grid that fills the canvas ---
+        # Fewer than 4 products sit in a single row; 4+ use a balanced grid so
+        # each product stays large instead of shrinking to fit one row.
+        n = len(processed_products)
+        cols = n if n <= 3 else math.ceil(math.sqrt(n))
+        rows = math.ceil(n / cols)
+
+        margin = 120                       # outer margin around the grid
+        cell_gap = max(gap, 50)            # space between grid cells
+        usable = self.CANVAS_SIZE - 2 * margin
+        cell_w = (usable - cell_gap * (cols - 1)) / cols
+        cell_h = (usable - cell_gap * (rows - 1)) / rows
+        product_max_h = min(cell_h * 0.86, max_height)  # leave room for the shadow
+
+        # Scale each product uniformly to fill its cell as much as possible.
+        # Uniform scaling only — no stretching/distortion (product fidelity).
+        scaled = []
         for img in processed_products:
-            resized = self._resize_product(img, max_height)
-            resized_products.append(resized)
+            s = min(cell_w / img.width, product_max_h / img.height)
+            scaled.append(img.resize(
+                (max(1, int(img.width * s)), max(1, int(img.height * s))), Image.LANCZOS,
+            ))
 
-        # Calculate total width needed
-        total_width = sum(img.width for img in resized_products)
-        total_width += gap * (len(resized_products) - 1)
+        # Centre the whole grid vertically
+        grid_h = rows * cell_h + cell_gap * (rows - 1)
+        grid_top = (self.CANVAS_SIZE - grid_h) / 2
 
-        # If total width exceeds canvas, scale down all products proportionally
-        max_width = self.CANVAS_SIZE - 200  # Leave 100px padding on each side
-        if total_width > max_width:
-            scale = max_width / total_width
-            resized_products = [img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS) for img in resized_products]
-            total_width = sum(img.width for img in resized_products) + gap * (len(resized_products) - 1)
-
-        # Calculate starting positions to center the row
-        start_x = (self.CANVAS_SIZE - total_width) // 2
-        baseline_y = int(self.CANVAS_SIZE * 0.72)  # Products sit slightly below center for shadow room
-
-        # Create white canvas
+        # Create white canvas + shadow layer
         canvas = Image.new("RGBA", (self.CANVAS_SIZE, self.CANVAS_SIZE), self.BACKGROUND_COLOR + (255,))
-
-        # Draw contact shadows first (behind products)
         shadow_layer = Image.new("RGBA", (self.CANVAS_SIZE, self.CANVAS_SIZE), (0, 0, 0, 0))
         shadow_draw = ImageDraw.Draw(shadow_layer)
 
-        current_x = start_x
-        for img in resized_products:
-            shadow_y = baseline_y + img.height // 2
-            shadow_w = img.width
-            # Draw an ellipse shadow beneath each product
+        placements = []
+        for idx, img in enumerate(scaled):
+            r = idx // cols
+            col_in_row = idx - r * cols
+            items_in_row = min(cols, n - r * cols)  # last row may be shorter -> centre it
+            row_w = items_in_row * cell_w + cell_gap * (items_in_row - 1)
+            row_left = (self.CANVAS_SIZE - row_w) / 2
+            cell_x = row_left + col_in_row * (cell_w + cell_gap)
+            cell_y = grid_top + r * (cell_h + cell_gap)
+            px = int(cell_x + (cell_w - img.width) / 2)          # centre in cell horizontally
+            baseline = cell_y + cell_h * 0.9                      # products "stand" near cell bottom
+            py = int(baseline - img.height)
+            placements.append((img, px, py))
+            # contact shadow beneath the product
             shadow_draw.ellipse(
-                [current_x, shadow_y - self.SHADOW_HEIGHT // 2,
-                 current_x + shadow_w, shadow_y + self.SHADOW_HEIGHT // 2],
-                fill=(0, 0, 0, self.SHADOW_OPACITY)
+                [px, int(baseline) - self.SHADOW_HEIGHT // 2,
+                 px + img.width, int(baseline) + self.SHADOW_HEIGHT // 2],
+                fill=(0, 0, 0, self.SHADOW_OPACITY),
             )
-            current_x += img.width + gap
 
-        # Blur the shadow layer
+        # Blur the shadow layer, then paste products on top
         shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=self.SHADOW_BLUR))
         canvas = Image.alpha_composite(canvas, shadow_layer)
-
-        # Paste each product onto the canvas
-        current_x = start_x
-        for img in resized_products:
-            # Center product vertically on baseline
-            paste_y = baseline_y - img.height // 2
-            # Use the image's alpha channel as the mask
-            canvas.paste(img, (current_x, paste_y), img)
-            current_x += img.width + gap
+        for img, px, py in placements:
+            canvas.paste(img, (px, py), img)  # alpha channel as mask
 
         # Apply roundel if needed (6+ identical items)
         if use_roundel and self.roundel_path and os.path.exists(self.roundel_path):
