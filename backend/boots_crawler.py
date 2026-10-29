@@ -25,6 +25,9 @@ X_AGENT_CLIENT = os.getenv("BOOTS_X_AGENT_CLIENT", "W-7njoVr89mFAk")
 SITEMAP_URL = "https://www.boots.com/wcsstore/eBootsStorefrontAssetStore/sitemap/uk-product-sitemap.xml"
 # Scene7 serves every product image deterministically by its 8-digit code.
 SCENE7_BASE = "https://boots.scene7.com/is/image/Boots"
+# Boots WCS catalog API — returns JSON directly, including a bundle's components
+# with their real quantities (the sitemap/HTML path can't give quantities).
+WCS_BASE = "https://www.boots.com/search/resources/store/11352/productview"
 
 
 class BootsCrawler:
@@ -97,10 +100,89 @@ class BootsCrawler:
                     pass
 
     async def search_bundle(self, product_code: str) -> dict | None:
-        """Resolve a bundle by its code via the product sitemap, then read its
-        product page for the component products. The main image is built
-        deterministically from Scene7. Falls back to the legacy site search when
-        the code is not in the sitemap."""
+        """Resolve a bundle by its code. Primary source is the Boots WCS catalog
+        API, which returns the bundle's components WITH their real quantities.
+        Falls back to the product sitemap + Scene7 (quantities default to 1) when
+        the API can't resolve the code."""
+        result = await self._search_bundle_wcs(product_code)
+        if result is not None:
+            return result
+        return await self._search_bundle_sitemap(product_code)
+
+    async def _search_bundle_wcs(self, product_code: str) -> dict | None:
+        """Resolve a bundle and its components (with real quantities) via WCS."""
+        entry = await self._wcs_get(f"{WCS_BASE}/bySearchTerm/{product_code}")
+        ce = (entry or {}).get("catalogEntryView") or []
+        if not ce:
+            return None
+        bundle = ce[0]
+        unique_id = bundle.get("uniqueID")
+        products = await self._wcs_components(unique_id) if unique_id else []
+        if not products:
+            return None  # fall back to the sitemap path if we got no components
+        return {
+            "code": product_code,
+            "title": bundle.get("name") or "",
+            "image_url": self.image_url(product_code),
+            "product_url": bundle.get("resourceId", ""),
+            "individual_products": products,
+        }
+
+    async def _wcs_components(self, unique_id: str) -> list:
+        """Fetch a bundle's components (partNumber, quantity, name) via byId.
+        Each component's image is the deterministic Scene7 URL."""
+        data = await self._wcs_get(f"{WCS_BASE}/byId/{unique_id}")
+        comps = self._find_key(data, "components") if data else None
+        products = []
+        for comp in comps or []:
+            part = comp.get("partNumber")
+            if not part:
+                continue
+            try:
+                qty = int(float(str(comp.get("quantity", "1")).strip() or "1"))
+            except (TypeError, ValueError):
+                qty = 1
+            products.append({
+                "code": str(part),
+                "name": comp.get("shortDescription") or comp.get("name") or "",
+                "quantity": max(1, qty),
+                "image_url": self.image_url(str(part)),
+            })
+        return products
+
+    async def _wcs_get(self, url: str) -> dict | None:
+        """GET a WCS API URL and return parsed JSON (or None on failure)."""
+        try:
+            resp = await self._client.get(url, params={"x-agent-client": self.x_agent_client})
+            if resp.status_code != 200:
+                return None
+            return resp.json()
+        except (httpx.HTTPError, json.JSONDecodeError, ValueError) as e:
+            logger.warning(f"WCS request failed ({url.rsplit('/', 1)[-1]}): {e}")
+            return None
+
+    @staticmethod
+    def _find_key(obj, key, depth: int = 0):
+        """Recursively find the first value for `key` in a nested dict/list."""
+        if depth > 5:
+            return None
+        if isinstance(obj, dict):
+            if key in obj:
+                return obj[key]
+            for value in obj.values():
+                found = BootsCrawler._find_key(value, key, depth + 1)
+                if found is not None:
+                    return found
+        elif isinstance(obj, list):
+            for value in obj:
+                found = BootsCrawler._find_key(value, key, depth + 1)
+                if found is not None:
+                    return found
+        return None
+
+    async def _search_bundle_sitemap(self, product_code: str) -> dict | None:
+        """Fallback: resolve via the product sitemap + Scene7. Component quantities
+        default to 1 (extracted from the page's Scene7 references)."""
         await self._ensure_sitemap()
         product_url = (self._code_to_url or {}).get(product_code)
 
