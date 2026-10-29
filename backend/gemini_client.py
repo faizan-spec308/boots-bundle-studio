@@ -74,7 +74,9 @@ class GeminiClient:
 
         # Initialize the client
         self.client = genai.Client(api_key=self.api_key)
-        self.model = "gemini-nano-banana-2.1"
+        # "Nano Banana" = Gemini 2.5 Flash Image. Overridable via env in case your
+        # account needs a different id (e.g. a preview or the Pro image variant).
+        self.model = os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
         logger.info(f"GeminiClient initialized with model: {self.model}")
 
     def edit_image(
