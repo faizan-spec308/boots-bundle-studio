@@ -8,12 +8,14 @@ export default function BundleCard({ bundle, activeTab, onUpdate }) {
   const [actionError, setActionError] = useState(null)
   const [approved, setApproved] = useState(false)
   const [regenerating, setRegenerating] = useState(false)
+  const [imgVersion, setImgVersion] = useState(0)  // cache-bust generated image on change
 
+  const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000'
   const originalSrc = bundle.original_image
-    ? `${import.meta.env.VITE_API_URL || 'http://localhost:8000'}/api/images/${bundle.original_image.split('/').pop()}`
+    ? `${API_BASE}/api/images/${bundle.original_image.split('/').pop()}`
     : null
   const generatedSrc = bundle.generated_image
-    ? `${import.meta.env.VITE_API_URL || 'http://localhost:8000'}/api/images/${bundle.generated_image.split('/').pop()}`
+    ? `${API_BASE}/api/images/${bundle.generated_image.split('/').pop()}?v=${imgVersion}`
     : null
 
   async function handleApprove() {
@@ -50,6 +52,7 @@ export default function BundleCard({ bundle, activeTab, onUpdate }) {
       const productPaths = (bundle.products || []).map(p => p.image_path).filter(Boolean)
       const quantities = (bundle.products || []).map(p => p.quantity || 1)
       const result = await generateImage(bundle.code, productPaths, quantities)
+      setImgVersion(v => v + 1)  // force the browser to load the new image
       onUpdate({ ...bundle, generated_image: result.image_path })
     } catch (err) {
       setActionError(err.message)
@@ -98,7 +101,7 @@ export default function BundleCard({ bundle, activeTab, onUpdate }) {
             <img src={generatedSrc} alt="Generated bundle image" />
           ) : (
             <div className="no-image">
-              {regenerating ? 'Generating…' : 'Not yet generated'}
+              {regenerating ? 'Generating…' : 'Original shown — use Regenerate to compose from product photos'}
             </div>
           )}
         </div>

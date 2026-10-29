@@ -368,70 +368,40 @@ class BundleProcessor:
                 'needs_regeneration': True,
             }
 
-        # Step 3: Determine arrangement
+        # Step 3: Determine arrangement (shown as advisory info on the card)
         arrangement = self.determine_arrangement(products)
 
-        # Step 4: Determine if we can compose
-        can_compose = (
-            product_images_found and
-            not arrangement['manual_review'] and
-            arrangement['single_image']
-        )
-
-        # Step 5: Decide whether the bundle needs a regenerated image.
-        # A single-product-type multipack (e.g. 3x one razor) is shown by Boots as
-        # one product with a "x3" number badge, so it must be regenerated to show
-        # the real items without a badge. Otherwise, only regenerate when the
-        # original image itself is poor; a good original is shown as-is.
+        # Step 4: Flag (advisory only) bundles whose original likely carries a
+        # multiplier badge. Single-product-type multipacks (e.g. 3x one razor) are
+        # shown by Boots with a "x3" tag. This is informational — it does NOT
+        # trigger auto-regeneration.
         has_original = bool(original_image_path and os.path.exists(original_image_path))
         total_items = sum(int(p.get('quantity', 1)) for p in products)
         product_types = len({p.get('code', '') for p in products})
         is_multipack_with_badge = product_types == 1 and total_items >= 2
         if is_multipack_with_badge:
-            # Boots shows this as one product with a "x3" badge — mark it as needing
-            # work and reflect that in the (otherwise meaningless) quality score.
-            quality['needs_regeneration'] = True
             quality['issues'] = [
                 *quality.get('issues', []),
                 f'Single product type shown {total_items}x — likely has a number badge',
             ]
             quality['score'] = round(min(quality.get('score', 0.8), 0.5), 2)
-        needs_regeneration = quality['needs_regeneration']
 
-        # Step 6: Categorize + decide whether a new image is produced
-        category, needs_regeneration = self.categorize_bundle(
-            bundle=bundle,
-            needs_regeneration=needs_regeneration,
-            product_images_found=product_images_found,
-            can_compose=can_compose,
-            has_original=has_original,
-        )
+        # Step 6: Default to the ORIGINAL Boots.com image — it is 100% faithful and
+        # must never be altered. We do NOT auto-compose from component photos (those
+        # can be a newer/different packaging version than the original). The team
+        # regenerates on demand via the Regenerate button (/api/generate), and can
+        # use the AI editor to remove a badge. Category reflects what action is
+        # available, not an automatic change.
+        if has_original:
+            category = 'ready'              # review/approve the faithful original
+        elif product_images_found:
+            category = 'manual'             # no original, but components exist
+        else:
+            category = 'supplier'           # nothing usable found on Boots.com
 
-        # Step 7: Generate a composed image ONLY when the bundle needs one
-        generated_image_path = None
-        if category == 'ready' and needs_regeneration and can_compose and composer:
-            try:
-                generated_image_path = os.path.join(uploads_dir, f"{code}_generated.jpg")
-                await asyncio.to_thread(
-                    composer.compose_bundle_image,
-                    product_image_paths,
-                    generated_image_path,
-                    product_quantities,
-                )
-                logger.info(f"Generated composed image for {code}")
-            except Exception:
-                logger.exception(f"Failed to generate image for {code}")
-                # Fall back to manual review if composition fails
-                category = 'manual'
-                generated_image_path = None
+        generated_image_path = None         # never auto-generated
 
-        # Step 8: Filter — a bundle whose original is already fine needs no action,
-        # so it is excluded from the dashboard entirely.
-        if category == 'ready' and not needs_regeneration:
-            logger.info(f"Bundle {code}: original is good — excluded from dashboard")
-            return None
-
-        # Step 9: Build result (only for bundles that need action)
+        # Step 7: Build result (all bundles are shown — the original is faithful)
         return {
             'code': code,
             'title': title,
@@ -442,7 +412,7 @@ class BundleProcessor:
             'quality_score': quality['score'],
             'quality_issues': quality['issues'],
             'arrangement_reasoning': arrangement['reasoning'],
-            'needs_regeneration': needs_regeneration,
+            'has_badge': is_multipack_with_badge,  # advisory: original likely has a multiplier badge
         }
 
     def _check_background_whiteness(self, img: Image.Image) -> float:

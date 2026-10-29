@@ -154,9 +154,9 @@ export default function EditPanel({ bundle, onClose, onUpdate }) {
           <div className="edit-suggestions">
             <p><strong>Quick suggestions:</strong></p>
             <div className="suggestion-chips">
+              <button onClick={() => setPrompt('Remove the multiplier number badge/tag (e.g. the "3" or "x3" label) from the image. Keep every product, its packaging, colours, text and logos exactly the same — change nothing else.')}>Remove number badge</button>
               <button onClick={() => setPrompt('Add more space between the products')}>Add more space</button>
               <button onClick={() => setPrompt('Make the products slightly bigger')}>Make bigger</button>
-              <button onClick={() => setPrompt('Make the products slightly smaller')}>Make smaller</button>
               <button onClick={() => setPrompt('Center the products in the image')}>Center products</button>
             </div>
           </div>
