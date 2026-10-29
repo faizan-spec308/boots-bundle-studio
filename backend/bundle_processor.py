@@ -371,62 +371,65 @@ class BundleProcessor:
         # Step 3: Determine arrangement (shown as advisory info on the card)
         arrangement = self.determine_arrangement(products)
 
-        # Step 4: Decide (from the WCS structure, per the spec) whether the bundle
-        # needs a regenerated image. A single-product-type multipack (qty >= 2) is
-        # shown by Boots as one product with a "x3" badge, so it NEEDS regeneration.
-        # A poor-quality original (non-white bg / too small) also needs it.
         has_original = bool(original_image_path and os.path.exists(original_image_path))
         total_items = sum(int(p.get('quantity', 1)) for p in products)
         product_types = len({p.get('code', '') for p in products})
         is_multipack_with_badge = product_types == 1 and total_items >= 2
-        if is_multipack_with_badge:
-            quality['needs_regeneration'] = True
-            quality['issues'] = [
-                *quality.get('issues', []),
-                f'Single product type shown {total_items}x — likely has a number badge',
-            ]
-            quality['score'] = round(min(quality.get('score', 0.8), 0.5), 2)
-        needs_regeneration = quality['needs_regeneration']
 
         can_compose = (
             product_images_found and
             not arrangement['manual_review'] and
             arrangement['single_image']
         )
-
-        # Step 5: Categorize. A good, multi-product original needs no action and is
-        # filtered out of the dashboard entirely.
-        category, needs_regeneration = self.categorize_bundle(
-            bundle=bundle,
-            needs_regeneration=needs_regeneration,
-            product_images_found=product_images_found,
-            can_compose=can_compose,
-            has_original=has_original,
-        )
-
-        # Step 6: Regenerate (compose from the component product photos) when needed.
         generated_image_path = None
-        if category == 'ready' and needs_regeneration and can_compose and composer:
-            try:
-                generated_image_path = os.path.join(uploads_dir, f"{code}_generated.jpg")
-                await asyncio.to_thread(
-                    composer.compose_bundle_image,
-                    product_image_paths,
-                    generated_image_path,
-                    product_quantities,
-                )
-                logger.info(f"Generated composed image for {code}")
-            except Exception:
-                logger.exception(f"Failed to generate image for {code}")
-                category = 'manual'
-                generated_image_path = None
+        needs_regeneration = False
 
-        # Step 7: Filter out fine bundles (good original, no action needed).
-        if category == 'ready' and not needs_regeneration:
-            logger.info(f"Bundle {code}: original is good — filtered out of dashboard")
-            return None
+        if is_multipack_with_badge:
+            # Step 4a: A single-product-type multipack is shown by Boots as one
+            # product with a "x3" badge baked into the ONLY available product photo.
+            # That badge can't be removed faithfully (PIL can't; AI mangles it), so
+            # there is no clean image — route to Supplier Image Required.
+            reason = (
+                f'Shown as one product with a "x{total_items}" badge baked into the only '
+                "available Boots.com image — no clean image found. "
+                "Request a badge-free image from the supplier."
+            )
+            quality['issues'] = [*quality.get('issues', []), reason]
+            quality['score'] = round(min(quality.get('score', 0.8), 0.5), 2)
+            category = 'supplier'
+            logger.info(f"Bundle {code}: supplier (badged multipack, no clean image available)")
+        else:
+            # Step 4b: Multi-type bundle. A good original needs no action (filtered
+            # out). A genuinely poor original is regenerated from the clean component
+            # photos when we can arrange them confidently.
+            needs_regeneration = quality['needs_regeneration']
+            category, needs_regeneration = self.categorize_bundle(
+                bundle=bundle,
+                needs_regeneration=needs_regeneration,
+                product_images_found=product_images_found,
+                can_compose=can_compose,
+                has_original=has_original,
+            )
+            if category == 'ready' and needs_regeneration and can_compose and composer:
+                try:
+                    generated_image_path = os.path.join(uploads_dir, f"{code}_generated.jpg")
+                    await asyncio.to_thread(
+                        composer.compose_bundle_image,
+                        product_image_paths,
+                        generated_image_path,
+                        product_quantities,
+                    )
+                    logger.info(f"Generated composed image for {code}")
+                except Exception:
+                    logger.exception(f"Failed to generate image for {code}")
+                    category = 'manual'
+                    generated_image_path = None
+            # A fine, multi-product original needs no action — filter it out.
+            if category == 'ready' and not needs_regeneration:
+                logger.info(f"Bundle {code}: original is good — filtered out of dashboard")
+                return None
 
-        # Step 8: Build result (only bundles that need action)
+        # Build result (only bundles that need action)
         return {
             'code': code,
             'title': title,
