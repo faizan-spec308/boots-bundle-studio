@@ -83,10 +83,11 @@ class ImageComposer:
             raise ValueError("No valid product images found")
 
         # --- Arrange products in a grid that fills the canvas ---
-        # Fewer than 4 products sit in a single row; 4+ use a balanced grid so
-        # each product stays large instead of shrinking to fit one row.
+        # Up to 5 items sit in a single horizontal row (shelf layout, per the
+        # "fewer than 6 identical -> horizontal row" rule); 6+ use a balanced grid
+        # so each product stays large instead of shrinking to fit one row.
         n = len(processed_products)
-        cols = n if n <= 3 else math.ceil(math.sqrt(n))
+        cols = n if n <= 5 else math.ceil(math.sqrt(n))
         rows = math.ceil(n / cols)
 
         margin = 120                       # outer margin around the grid
@@ -109,6 +110,13 @@ class ImageComposer:
         grid_h = rows * cell_h + cell_gap * (rows - 1)
         grid_top = (self.CANVAS_SIZE - grid_h) / 2
 
+        # Tallest product in each row — used to share a baseline and centre the
+        # row's products vertically (shelf layout) instead of leaving them low.
+        row_max_h = {}
+        for idx, img in enumerate(scaled):
+            r = idx // cols
+            row_max_h[r] = max(row_max_h.get(r, 0), img.height)
+
         # Create white canvas + shadow layer
         canvas = Image.new("RGBA", (self.CANVAS_SIZE, self.CANVAS_SIZE), self.BACKGROUND_COLOR + (255,))
         shadow_layer = Image.new("RGBA", (self.CANVAS_SIZE, self.CANVAS_SIZE), (0, 0, 0, 0))
@@ -124,7 +132,8 @@ class ImageComposer:
             cell_x = row_left + col_in_row * (cell_w + cell_gap)
             cell_y = grid_top + r * (cell_h + cell_gap)
             px = int(cell_x + (cell_w - img.width) / 2)          # centre in cell horizontally
-            baseline = cell_y + cell_h * 0.9                      # products "stand" near cell bottom
+            # shared baseline per row, placed so the row's products are vertically centred
+            baseline = cell_y + cell_h / 2 + row_max_h[r] / 2
             py = int(baseline - img.height)
             placements.append((img, px, py))
             # contact shadow beneath the product

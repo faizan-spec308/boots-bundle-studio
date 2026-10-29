@@ -126,41 +126,34 @@ class BundleProcessor:
     def categorize_bundle(
         self,
         bundle: dict,
-        quality_assessment: dict,
+        needs_regeneration: bool,
         product_images_found: bool,
         can_compose: bool,
+        has_original: bool,
     ) -> str:
         """
         Categorize a bundle into one of three dashboard sections.
 
-        Args:
-            bundle: Bundle metadata dict (code, title, products, quantities).
-            quality_assessment: Result from assess_quality().
-            product_images_found: Whether suitable individual product images were found.
-            can_compose: Whether the image_composer can confidently compose this bundle.
-
-        Returns:
-            One of: 'ready', 'supplier', 'manual'
+        - 'ready'    : the original image is already fine (shown as-is), OR it needs
+                       a new image and we can confidently compose one.
+        - 'supplier' : needs a new image but no component product images were found.
+        - 'manual'   : needs a new image but a confident arrangement can't be made.
         """
-        # Rule 1: If no product images found → Supplier Image Required
-        if not product_images_found:
-            logger.info(f"Bundle {bundle.get('code', '?')}: supplier (no product images)")
-            return 'supplier'
+        code = bundle.get('code', '?')
 
-        # Rule 2: If we can't confidently compose → Manual Review Required
-        if not can_compose:
-            logger.info(f"Bundle {bundle.get('code', '?')}: manual (cannot compose)")
-            return 'manual'
-
-        # Rule 3: If quality is poor or needs regeneration → Ready for Approval
-        # (we'll generate a better image)
-        if quality_assessment['needs_regeneration']:
-            logger.info(f"Bundle {bundle.get('code', '?')}: ready (needs regeneration)")
+        # If the original is already good, show it as-is — do NOT regenerate.
+        if not needs_regeneration and has_original:
+            logger.info(f"Bundle {code}: ready (original is fine, no regeneration)")
             return 'ready'
 
-        # Rule 4: If quality is acceptable but not perfect → Ready for Approval
-        # (user can approve the original or request regeneration)
-        logger.info(f"Bundle {bundle.get('code', '?')}: ready (quality acceptable)")
+        # From here, the bundle needs a (re)generated image.
+        if not product_images_found:
+            logger.info(f"Bundle {code}: supplier (needs image, no component images)")
+            return 'supplier'
+        if not can_compose:
+            logger.info(f"Bundle {code}: manual (needs image, cannot arrange confidently)")
+            return 'manual'
+        logger.info(f"Bundle {code}: ready (will regenerate)")
         return 'ready'
 
     def determine_arrangement(
@@ -378,17 +371,28 @@ class BundleProcessor:
             arrangement['single_image']
         )
 
-        # Step 5: Categorize
+        # Step 5: Decide whether the bundle needs a regenerated image.
+        # A single-product-type multipack (e.g. 3x one razor) is shown by Boots as
+        # one product with a "x3" number badge, so it must be regenerated to show
+        # the real items without a badge. Otherwise, only regenerate when the
+        # original image itself is poor; a good original is shown as-is.
+        has_original = bool(original_image_path and os.path.exists(original_image_path))
+        total_items = sum(int(p.get('quantity', 1)) for p in products)
+        is_multipack_with_badge = len(products) == 1 and total_items >= 2
+        needs_regeneration = is_multipack_with_badge or quality['needs_regeneration']
+
+        # Step 6: Categorize
         category = self.categorize_bundle(
             bundle=bundle,
-            quality_assessment=quality,
+            needs_regeneration=needs_regeneration,
             product_images_found=product_images_found,
             can_compose=can_compose,
+            has_original=has_original,
         )
 
-        # Step 6: Generate composed image if needed and possible (PIL off the loop)
+        # Step 7: Generate a composed image ONLY when the bundle needs one
         generated_image_path = None
-        if category == 'ready' and can_compose and composer:
+        if category == 'ready' and needs_regeneration and can_compose and composer:
             try:
                 generated_image_path = os.path.join(uploads_dir, f"{code}_generated.jpg")
                 await asyncio.to_thread(
@@ -404,7 +408,7 @@ class BundleProcessor:
                 category = 'manual'
                 generated_image_path = None
 
-        # Step 7: Build result
+        # Step 8: Build result
         return {
             'code': code,
             'title': title,
