@@ -101,7 +101,7 @@ export default function BundleCard({ bundle, activeTab, onUpdate }) {
             <img src={generatedSrc} alt="Generated bundle image" />
           ) : (
             <div className="no-image">
-              {regenerating ? 'Generating…' : 'Original shown — use Regenerate to compose from product photos'}
+              {regenerating ? 'Generating…' : 'Not yet generated'}
             </div>
           )}
         </div>
