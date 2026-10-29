@@ -9,6 +9,7 @@ export default function App() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [progress, setProgress] = useState(null)
+  const [liveTotal, setLiveTotal] = useState(0)
   const [activeTab, setActiveTab] = useState('ready')
   const [backendOnline, setBackendOnline] = useState(false)
   const pollRef = useRef(null)
@@ -43,6 +44,7 @@ export default function App() {
       const data = await fetchBundles(refresh)
       if (data.status === 'ready') {
         setBundles(data.bundles || [])
+        setLiveTotal(data.live_total || (data.bundles || []).length)
         setProgress(null)
         setLoading(false)
         setError(null)
@@ -121,6 +123,17 @@ export default function App() {
       </header>
 
       <TabBar activeTab={activeTab} onTabChange={setActiveTab} counts={tabCounts} />
+
+      {!loading && bundles.length > 0 && (
+        <div className="summary-bar">
+          <strong>{bundles.length}</strong> need action
+          {tabCounts.supplier > 0 && <> · {tabCounts.supplier} supplier</>}
+          {tabCounts.manual > 0 && <> · {tabCounts.manual} manual review</>}
+          {liveTotal > bundles.length && (
+            <> · {liveTotal - bundles.length} fine (hidden)</>
+          )}
+        </div>
+      )}
 
       <main className="app-main">
         {error && (

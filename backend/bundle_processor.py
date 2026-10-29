@@ -61,7 +61,7 @@ class BundleProcessor:
             }
         """
         issues = []
-        score = 1.0
+        score = 0.8  # start at 0.8 so scores are meaningful (not always 100%)
 
         if not os.path.exists(bundle_image_path):
             return {
@@ -385,8 +385,18 @@ class BundleProcessor:
         # original image itself is poor; a good original is shown as-is.
         has_original = bool(original_image_path and os.path.exists(original_image_path))
         total_items = sum(int(p.get('quantity', 1)) for p in products)
-        is_multipack_with_badge = len(products) == 1 and total_items >= 2
-        needs_regeneration = is_multipack_with_badge or quality['needs_regeneration']
+        product_types = len({p.get('code', '') for p in products})
+        is_multipack_with_badge = product_types == 1 and total_items >= 2
+        if is_multipack_with_badge:
+            # Boots shows this as one product with a "x3" badge — mark it as needing
+            # work and reflect that in the (otherwise meaningless) quality score.
+            quality['needs_regeneration'] = True
+            quality['issues'] = [
+                *quality.get('issues', []),
+                f'Single product type shown {total_items}x — likely has a number badge',
+            ]
+            quality['score'] = round(min(quality.get('score', 0.8), 0.5), 2)
+        needs_regeneration = quality['needs_regeneration']
 
         # Step 6: Categorize + decide whether a new image is produced
         category, needs_regeneration = self.categorize_bundle(

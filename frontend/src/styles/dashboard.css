@@ -530,8 +530,67 @@ body {
   margin-bottom: 20px;
 }
 
+.summary-bar {
+  padding: 8px 24px;
+  background: var(--white);
+  border-bottom: 1px solid var(--gray-200);
+  color: var(--gray-700);
+  font-size: 0.85rem;
+}
+
+.summary-bar strong {
+  color: var(--boots-navy);
+}
+
 .edit-image-side {
   text-align: center;
+  position: relative;
+}
+
+/* Real-time edit feedback */
+.edit-loading-overlay {
+  position: absolute;
+  inset: 24px 0 0 0;            /* leave the <h4> label visible */
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  background: rgba(255, 255, 255, 0.82);
+  border-radius: 8px;
+  font-size: 0.85rem;
+  color: var(--gray-700);
+}
+
+.edit-applied {
+  background: #e7f6ec;
+  color: var(--boots-green);
+  border: 1px solid #b7e2c4;
+  padding: 8px 14px;
+  border-radius: 8px;
+  font-size: 0.85rem;
+  margin-bottom: 12px;
+}
+
+.edit-history {
+  margin-top: 14px;
+  font-size: 0.82rem;
+  color: var(--gray-700);
+}
+
+.edit-history ol {
+  margin: 6px 0 0;
+  padding-left: 20px;
+}
+
+.edit-history li {
+  margin-bottom: 3px;
+}
+
+.edit-history-time {
+  color: var(--gray-500);
+  font-variant-numeric: tabular-nums;
+  margin-right: 6px;
 }
 
 .edit-image-side h4 {

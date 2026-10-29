@@ -19,7 +19,7 @@ from PIL import Image, ImageDraw, ImageFilter
 class ImageComposer:
     CANVAS_SIZE = 2000
     BACKGROUND_COLOR = (255, 255, 255)
-    MAX_PRODUCT_HEIGHT = 1600  # Max height for each product (leaves room for shadow)
+    MAX_PRODUCT_HEIGHT = 1500  # 75% of canvas — products fill the canvas, not tiny
     DEFAULT_GAP = 60  # Default gap between products in pixels
     SHADOW_OPACITY = 120
     SHADOW_BLUR = 25
@@ -175,89 +175,6 @@ class ImageComposer:
         right = min(img.width, bbox[2] + pad)
         bottom = min(img.height, bbox[3] + pad)
         return img.crop((left, top, right, bottom))
-
-    def edit_bundle_image(
-        self,
-        current_image_path: str,
-        edit_prompt: str,
-        output_path: str,
-    ) -> str:
-        """
-        Edit an existing bundle image based on natural language instructions.
-        Parses the edit prompt and applies programmatic changes.
-
-        Supported edits:
-        - "add space" / "add gap" / "increase gap" → increase spacing between products
-        - "reduce space" / "reduce gap" / "move closer" → decrease spacing
-        - "make products bigger" / "increase size" → scale up products
-        - "make products smaller" / "decrease size" → scale down products
-        - "center" / "center products" → re-center the row
-
-        Args:
-            current_image_path: Path to the current bundle image
-            edit_prompt: Natural language edit instructions
-            output_path: Where to save the edited image
-
-        Returns:
-            The output file path
-        """
-        prompt_lower = edit_prompt.lower().strip()
-
-        # Parse the edit prompt to determine what changes to make
-        gap_adjustment = 0
-        size_adjustment = 1.0
-        recenter = False
-
-        # Space/gap adjustments
-        if any(phrase in prompt_lower for phrase in ["add space", "add gap", "increase gap", "more space", "increase space", "wider gap", "spread"]):
-            gap_adjustment = 80  # Add 80px more gap
-        elif any(phrase in prompt_lower for phrase in ["reduce space", "reduce gap", "move closer", "less space", "decrease gap", "narrower gap", "close gap"]):
-            gap_adjustment = -40  # Reduce gap by 40px
-
-        # Size adjustments
-        if any(phrase in prompt_lower for phrase in ["bigger", "larger", "increase size", "scale up", "make bigger", "make large"]):
-            size_adjustment = 1.15  # 15% bigger
-        elif any(phrase in prompt_lower for phrase in ["smaller", "decrease size", "scale down", "make small", "too big", "too large", "reduce size"]):
-            size_adjustment = 0.85  # 15% smaller
-
-        # Centering
-        if "center" in prompt_lower:
-            recenter = True
-
-        # For now, we can't re-parse the current image to extract individual products
-        # This is a limitation of programmatic editing on composed images.
-        # For full edit support, the frontend should send the original product images
-        # along with the edit prompt, so we can re-compose from scratch.
-
-        # If no recognizable edit, just copy the image
-        if gap_adjustment == 0 and size_adjustment == 1.0 and not recenter:
-            print(f"Edit prompt not recognized for programmatic editing: '{edit_prompt}'")
-            print("Returning original image unchanged. For AI-based editing, use the Gemini client.")
-            import shutil
-            shutil.copy2(current_image_path, output_path)
-            return output_path
-
-        # Apply the edit by loading the image and adjusting
-        img = Image.open(current_image_path).convert("RGBA")
-
-        if size_adjustment != 1.0:
-            new_width = int(img.width * size_adjustment)
-            new_height = int(img.height * size_adjustment)
-            img = img.resize((new_width, new_height), Image.LANCZOS)
-
-        # Create new canvas and center
-        canvas = Image.new("RGBA", (self.CANVAS_SIZE, self.CANVAS_SIZE), self.BACKGROUND_COLOR + (255,))
-        if recenter or size_adjustment != 1.0:
-            paste_x = (self.CANVAS_SIZE - img.width) // 2
-            paste_y = (self.CANVAS_SIZE - img.height) // 2
-            canvas.paste(img, (paste_x, paste_y), img)
-        else:
-            canvas.paste(img, (0, 0), img)
-
-        canvas = canvas.convert("RGB")
-        canvas.save(output_path, "JPEG", quality=95)
-        print(f"Edited bundle image saved to: {output_path}")
-        return output_path
 
     def compose_from_product_images(
         self,

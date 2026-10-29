@@ -507,56 +507,24 @@ async def generate_image(request: GenerateRequest):
 @app.post("/api/edit")
 async def edit_image(request: EditRequest):
     """
-    Edit a bundle image based on natural language instructions.
-
-    Strategy:
-    1. Try programmatic edit first (PIL — instant, 100% fidelity)
-    2. If the prompt can't be handled programmatically, use Gemini API
-    3. If Gemini fails, return an error with a meaningful message
+    Edit a bundle image using ONLY the Gemini API (no PIL editing — PIL can only
+    resize the whole image as a flat block, it can't re-compose). The fidelity
+    preamble is applied inside the Gemini client.
     """
     try:
-        composer = get_composer()
-        output_path = os.path.join(UPLOADS_DIR, f"{request.bundle_code}_edited.jpg")
-
         # Validate the source image path stays within the uploads dir
         safe_image = safe_upload_path(request.image_path)
         if not safe_image or not os.path.exists(safe_image):
-            raise HTTPException(status_code=400, detail=f"Image not found: {request.image_path}")
+            raise HTTPException(status_code=400, detail=f"Invalid image path: {request.image_path}")
         safe_refs = [
             s for s in (safe_upload_path(p) for p in request.reference_image_paths)
             if s and os.path.exists(s)
         ]
 
-        # Step 1: Try programmatic edit first
-        prompt_lower = request.edit_prompt.lower().strip()
-        programmatic_keywords = [
-            "add space", "add gap", "increase gap", "more space", "increase space",
-            "reduce space", "reduce gap", "move closer", "less space", "decrease gap",
-            "bigger", "larger", "increase size", "scale up",
-            "smaller", "decrease size", "scale down", "too big", "too large", "reduce size",
-            "center", "centre",
-        ]
-
-        is_programmatic = any(kw in prompt_lower for kw in programmatic_keywords)
-
-        if is_programmatic:
-            logger.info(f"Using PIL for programmatic edit: '{request.edit_prompt[:60]}'")
-            result_path = composer.edit_bundle_image(
-                current_image_path=safe_image,
-                edit_prompt=request.edit_prompt,
-                output_path=output_path,
-            )
-            return {
-                "status": "success",
-                "bundle_code": request.bundle_code,
-                "image_path": result_path,
-                "method": "pil_programmatic",
-            }
-
-        # Step 2: Use Gemini for AI-powered edits
-        logger.info(f"Using Gemini for AI edit: '{request.edit_prompt[:60]}'")
         gemini = get_gemini_client()
+        output_path = os.path.join(UPLOADS_DIR, f"{request.bundle_code}_edited.jpg")
 
+        logger.info(f"Gemini AI edit for {request.bundle_code}: '{request.edit_prompt[:60]}'")
         result_path = gemini.edit_image(
             image_path=safe_image,
             prompt=request.edit_prompt,
@@ -567,24 +535,18 @@ async def edit_image(request: EditRequest):
         # Keep the edited image the same size as the source (Gemini returns ~1024px)
         resize_to_match(result_path, safe_image)
 
-        # Step 3: Run a basic fidelity check
         fidelity = gemini.check_fidelity(safe_image, result_path)
-        if not fidelity["passed"]:
-            logger.warning(f"Fidelity check failed for {request.bundle_code}: {fidelity['issues']}")
-            return {
-                "status": "success_with_warnings",
-                "bundle_code": request.bundle_code,
-                "image_path": result_path,
-                "method": "gemini_ai",
-                "warnings": fidelity["issues"],
-            }
-
-        return {
+        response = {
             "status": "success",
             "bundle_code": request.bundle_code,
             "image_path": result_path,
             "method": "gemini_ai",
+            "fidelity_passed": fidelity["passed"],
         }
+        if not fidelity["passed"]:
+            logger.warning(f"Fidelity warnings for {request.bundle_code}: {fidelity['issues']}")
+            response["warnings"] = fidelity["issues"]
+        return response
 
     except HTTPException:
         raise
