@@ -41,6 +41,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from PIL import Image
 from pydantic import BaseModel
 
 # Load variables from a local .env file for development (no-op in production,
@@ -207,6 +208,23 @@ def safe_upload_path(path: str) -> str | None:
         # Paths on different drives (Windows) raise ValueError.
         return None
     return target
+
+
+def resize_to_match(image_path: str, reference_path: str) -> None:
+    """Resize image_path to the dimensions of reference_path (best-effort).
+    Gemini returns a fixed-size image (~1024x1024); matching the source keeps
+    edited images consistent with the rest of the pipeline and avoids a spurious
+    'dimensions changed' fidelity warning."""
+    try:
+        with Image.open(reference_path) as ref:
+            size = ref.size
+        with Image.open(image_path) as edited:
+            if edited.size != size:
+                edited.convert("RGB").resize(size, Image.LANCZOS).save(
+                    image_path, "JPEG", quality=95,
+                )
+    except (OSError, ValueError) as e:
+        logger.warning(f"Could not resize edited image to source size: {e}")
 
 
 def load_approved() -> dict:
@@ -515,6 +533,9 @@ async def edit_image(request: EditRequest):
             output_path=output_path,
             reference_images=safe_refs or None,
         )
+
+        # Keep the edited image the same size as the source (Gemini returns ~1024px)
+        resize_to_match(result_path, safe_image)
 
         # Step 3: Run a basic fidelity check
         fidelity = gemini.check_fidelity(safe_image, result_path)
