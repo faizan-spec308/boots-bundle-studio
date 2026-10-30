@@ -158,10 +158,13 @@ export default function App() {
     <div className="app">
       <header className="app-header">
         <div className="header-left">
-          <h1>Boots Bundle Image Studio</h1>
+          <div className="brand">
+            <span className="eyebrow">Product Enrichment</span>
+            <h1>Bundle Image Studio</h1>
+          </div>
           <div className={`health-badge ${backendOnline ? 'online' : 'offline'}`}>
             <span className="health-dot"></span>
-            {backendOnline ? 'Backend Connected' : 'Backend Offline'}
+            {backendOnline ? 'Connected' : 'Offline'}
           </div>
         </div>
         <div className="header-right">
