@@ -159,8 +159,11 @@ export default function App() {
       <header className="app-header">
         <div className="header-left">
           <div className="brand">
-            <span className="eyebrow">Product Enrichment</span>
-            <h1>Bundle Image Studio</h1>
+            <span className="brand-mark" aria-hidden="true">B</span>
+            <span className="brand-text">
+              <span className="eyebrow">Product Enrichment</span>
+              <h1>Bundle Image Studio</h1>
+            </span>
           </div>
           <div className={`health-badge ${backendOnline ? 'online' : 'offline'}`}>
             <span className="health-dot"></span>

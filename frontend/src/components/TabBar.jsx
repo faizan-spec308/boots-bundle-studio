@@ -9,16 +9,19 @@ export default function TabBar({ activeTab, onTabChange, counts }) {
 
   return (
     <nav className="tab-bar">
-      {tabs.map(tab => (
-        <button
-          key={tab.id}
-          className={`tab ${activeTab === tab.id ? 'active' : ''}`}
-          onClick={() => onTabChange(tab.id)}
-        >
-          <span className="tab-label">{tab.label}</span>
-          <span className="tab-count">{tab.count}</span>
-        </button>
-      ))}
+      <div className="tab-bar-inner">
+        {tabs.map(tab => (
+          <button
+            key={tab.id}
+            data-tab={tab.id}
+            className={`tab ${activeTab === tab.id ? 'active' : ''}`}
+            onClick={() => onTabChange(tab.id)}
+          >
+            <span className="tab-label">{tab.label}</span>
+            <span className="tab-count">{tab.count}</span>
+          </button>
+        ))}
+      </div>
     </nav>
   )
 }
