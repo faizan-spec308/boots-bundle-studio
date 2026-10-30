@@ -54,6 +54,7 @@ from bundle_processor import BundleProcessor
 from gemini_client import GeminiClient
 from image_composer import ImageComposer
 from monday_client import MondayClient
+from vision_classifier import VisionClassifier
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -81,6 +82,7 @@ MONDAY_API_TOKEN = os.getenv("MONDAY_API_TOKEN", "")
 MONDAY_BOARD_ID = os.getenv("MONDAY_BOARD_ID", "5100428483")
 BOOTS_X_AGENT_CLIENT = os.getenv("BOOTS_X_AGENT_CLIENT", "W-7njoVr89mFAk")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+VISION_MODEL = os.getenv("VISION_MODEL", "gemini-3-flash-preview")
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()]
 # Browsers reject `Access-Control-Allow-Origin: *` together with credentials,
 # so only allow credentials when explicit origins are configured.
@@ -106,6 +108,7 @@ _bundle_load: dict = {
 }
 _bundle_task = None
 _crawler = None  # shared BootsCrawler (pooled HTTP client), created lazily
+_classifier = None  # shared VisionClassifier, created lazily
 
 # ---------------------------------------------------------------------------
 # Initialize FastAPI app
@@ -178,6 +181,24 @@ def get_crawler() -> BootsCrawler:
 def get_composer() -> ImageComposer:
     """Create an ImageComposer instance."""
     return ImageComposer(roundel_path=ROUNDEL_PATH if os.path.exists(ROUNDEL_PATH) else None)
+
+
+def get_classifier() -> VisionClassifier | None:
+    """Return the shared VisionClassifier, or None if no Gemini key is set.
+
+    When it's None the processor falls back to its structural catalogue rules,
+    so the pipeline still runs — just without image-based badge detection.
+    """
+    global _classifier
+    if not GEMINI_API_KEY:
+        return None
+    if _classifier is None:
+        try:
+            _classifier = VisionClassifier(api_key=GEMINI_API_KEY, model=VISION_MODEL)
+        except Exception as e:  # noqa: BLE001 — missing SDK must not break loading
+            logger.warning(f"VisionClassifier unavailable: {e}")
+            return None
+    return _classifier
 
 
 def get_gemini_client() -> GeminiClient:
@@ -275,21 +296,18 @@ async def readyz():
 # Main API endpoints
 # ---------------------------------------------------------------------------
 
-DEFAULT_BUNDLE_LIMIT = int(os.getenv("BUNDLE_PROCESS_LIMIT", "7"))
+DEFAULT_BUNDLE_LIMIT = int(os.getenv("BUNDLE_PROCESS_LIMIT", "50"))
 # Testing toggle: skip the Monday.com download and parse the local files in
 # ORIGINALS_DIR instead (also bypasses the confirmed-live cache so parsing runs).
 USE_LOCAL_FILES = os.getenv("USE_LOCAL_FILES", "").strip().lower() in ("1", "true", "yes")
 
-# A fixed demo/test set. When set (the default), /api/bundles uses these codes
-# directly and skips Monday.com entirely (no 45MB download or parse) — the WCS
-# crawler supplies each bundle's title, components, and quantities from the code.
-# Set TEST_BUNDLE_CODES="" (empty) to use the real Monday.com confirmed-live list.
-_DEFAULT_TEST_CODES = (
-    "10359241,10397935,10372752,10397449,"  # need regeneration (number badges)
-    "10261022,10348931,10346368"            # already fine (shown as-is)
-)
+# Optional fixed demo/test set. When set, /api/bundles uses these codes directly
+# and skips Monday.com entirely (no 45MB download or parse) — the WCS crawler
+# supplies each bundle's title, components, and quantities from the code.
+# Default is EMPTY: pull the real Monday.com confirmed-live list and classify a
+# real batch. Set TEST_BUNDLE_CODES="10359241,..." to pin a specific demo set.
 TEST_BUNDLE_CODES = [
-    c.strip() for c in os.getenv("TEST_BUNDLE_CODES", _DEFAULT_TEST_CODES).split(",") if c.strip()
+    c.strip() for c in os.getenv("TEST_BUNDLE_CODES", "").split(",") if c.strip()
 ]
 BUNDLE_CACHE_TTL = int(os.getenv("BUNDLE_CACHE_TTL", "3600"))  # processed-results cache (1h)
 
@@ -363,22 +381,32 @@ async def _load_bundles_job(refresh: bool, limit: int, force: bool) -> None:
         composer = get_composer()
         processor = get_processor()
 
-        # 2) Resolve the bundle set (test codes by default — no Monday download)
+        # 2) Resolve the bundle set (test codes if set — otherwise Monday.com)
         confirmed = await _confirmed_live(refresh)
         _bundle_load["live_total"] = len(confirmed)
-        batch = confirmed[:limit]
+        # Sample evenly across the whole confirmed list rather than taking the
+        # first N. Monday rows are grouped by product family, so the first N are
+        # often near-duplicates (e.g. all nappy bags) — an even stride gives the
+        # reviewer a varied first batch.
+        if len(confirmed) > limit:
+            step = len(confirmed) / limit
+            batch = [confirmed[int(i * step)] for i in range(limit)]
+        else:
+            batch = confirmed
         _bundle_load.update(
-            phase="Crawling Boots.com & composing images", total=len(batch), processed=0,
+            phase="Classifying images & composing where needed",
+            total=len(batch), processed=0,
         )
         logger.info(f"Resolved {len(confirmed)} bundles (processing {len(batch)})")
 
         def _cb(done: int, _total: int) -> None:
             _bundle_load["processed"] = done
 
-        # 3) Process + cache the results
+        # 3) Process + cache the results (vision classifier flags what needs fixing)
         results = await processor.process_bundles(
             bundles=batch, crawler=crawler, composer=composer,
             uploads_dir=UPLOADS_DIR, progress_cb=_cb,
+            classifier=get_classifier(),
         )
         bundle_data_cache = results
         try:

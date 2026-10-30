@@ -240,6 +240,7 @@ class BundleProcessor:
         uploads_dir: str = "uploads",
         progress_cb=None,
         max_concurrency: int = 8,
+        classifier=None,
     ) -> list[dict]:
         """
         Full pipeline: assess quality, crawl for product images, categorize, and
@@ -277,7 +278,9 @@ class BundleProcessor:
 
         async def worker(index: int, bundle: dict) -> None:
             async with sem:
-                result = await self._process_one(bundle, crawler, composer, uploads_dir)
+                result = await self._process_one(
+                    bundle, crawler, composer, uploads_dir, classifier,
+                )
             results[index] = result
             async with lock:
                 counter["done"] += 1
@@ -296,13 +299,93 @@ class BundleProcessor:
 
         return results
 
-    async def _process_one(self, bundle: dict, crawler, composer, uploads_dir: str) -> dict | None:
-        """Crawl, assess, categorize, and (if possible) compose a single bundle."""
+    @staticmethod
+    def _result(code, title, category, original_image, generated_image, products,
+                quality_score, quality_issues, arrangement_reasoning, needs_regeneration):
+        """Assemble a dashboard result dict for a bundle that needs action."""
+        return {
+            'code': code,
+            'title': title,
+            'category': category,
+            'original_image': original_image,
+            'generated_image': generated_image,
+            'products': products,
+            'quality_score': round(float(quality_score), 2),
+            'quality_issues': quality_issues,
+            'arrangement_reasoning': arrangement_reasoning,
+            'needs_regeneration': needs_regeneration,
+        }
+
+    async def _download_components(self, crawler, products, uploads_dir):
+        """Download each component's product photo. Called ONLY when we may
+        regenerate, so fine bundles never pay for component downloads."""
+        paths: list = []
+        quantities: list = []
+        if not crawler:
+            for product in products:
+                if product.get('image_path') and os.path.exists(product['image_path']):
+                    paths.append(product['image_path'])
+                    quantities.append(product.get('quantity', 1))
+            return paths, quantities
+
+        async def _fetch(product):
+            pcode = product.get('code', '')
+            if not pcode:
+                return None
+            img = await crawler.download_product_image(
+                pcode, product.get('image_url'), uploads_dir,
+            )
+            if img:
+                product['image_path'] = img
+            return (img, product.get('quantity', 1)) if img else None
+
+        for res in await asyncio.gather(*(_fetch(p) for p in products)):
+            if res:
+                paths.append(res[0])
+                quantities.append(res[1])
+        return paths, quantities
+
+    async def _regenerate_or_manual(self, code, title, original_image_path, products,
+                                    arrangement, crawler, composer, uploads_dir,
+                                    quality_score, issues):
+        """Download clean component photos and compose a new image if we can
+        arrange them confidently; otherwise route to manual review."""
+        product_image_paths, product_quantities = await self._download_components(
+            crawler, products, uploads_dir,
+        )
+        can_compose = (
+            bool(product_image_paths)
+            and not arrangement['manual_review']
+            and arrangement['single_image']
+        )
+        if can_compose and composer:
+            try:
+                generated_image_path = os.path.join(uploads_dir, f"{code}_generated.jpg")
+                await asyncio.to_thread(
+                    composer.compose_bundle_image,
+                    product_image_paths,
+                    generated_image_path,
+                    product_quantities,
+                )
+                logger.info(f"Generated composed image for {code}")
+                return self._result(code, title, 'ready', original_image_path,
+                                     generated_image_path, products, quality_score,
+                                     issues, arrangement['reasoning'], True)
+            except Exception:
+                logger.exception(f"Failed to generate image for {code}")
+        return self._result(code, title, 'manual', original_image_path, None, products,
+                             quality_score, issues, arrangement['reasoning'], True)
+
+    async def _process_one(self, bundle: dict, crawler, composer, uploads_dir: str,
+                           classifier=None) -> dict | None:
+        """Crawl, classify the original image, and (if needed) compose a bundle.
+
+        Fast path: fetch only the original image + product metadata, then let the
+        vision classifier decide. Fine bundles return None (filtered) without ever
+        downloading component photos — that's what keeps large batches quick.
+        """
         code = bundle.get('code', '')
         title = bundle.get('title', '')
-
-        product_image_paths = []
-        product_quantities = []  # kept aligned with product_image_paths
         original_image_path = None
 
         # Monday rows carry no per-product breakdown, so fall back to the
@@ -310,8 +393,8 @@ class BundleProcessor:
         products = list(bundle.get('products') or [])
 
         # Step 1: Crawl Boots.com — ONE page load gives the bundle's main image and
-        # its individual products (with image URLs). We then download those images
-        # directly instead of re-searching each product. Cached files are reused.
+        # its individual products (with image URLs). We download the ORIGINAL only;
+        # component photos are fetched later, and only if we decide to regenerate.
         if crawler:
             try:
                 bundle_info = await crawler.search_bundle(code)
@@ -327,37 +410,85 @@ class BundleProcessor:
                         products = list(bundle_info['individual_products'])
                     if not title and bundle_info.get('title'):
                         title = bundle_info['title']
-
-                # Download product images from the URLs already extracted above,
-                # concurrently and skipping any that are already cached.
-                async def _fetch(product):
-                    pcode = product.get('code', '')
-                    if not pcode:
-                        return None
-                    img = await crawler.download_product_image(
-                        pcode, product.get('image_url'), uploads_dir,
-                    )
-                    if img:
-                        product['image_path'] = img
-                    return (img, product.get('quantity', 1)) if img else None
-
-                for res in await asyncio.gather(*(_fetch(p) for p in products)):
-                    if res:
-                        product_image_paths.append(res[0])
-                        product_quantities.append(res[1])
             except Exception as e:  # noqa: BLE001 — crawl failures must not abort the batch
                 logger.warning(f"Crawler failed for {code}: {e}")
-        else:
-            # Use any product image paths already in the bundle data
-            for product in products:
-                if product.get('image_path') and os.path.exists(product['image_path']):
-                    product_image_paths.append(product['image_path'])
-                    product_quantities.append(product.get('quantity', 1))
 
+        has_original = bool(original_image_path and os.path.exists(original_image_path))
+        total_items = sum(int(p.get('quantity', 1)) for p in products)
+        product_types = len({p.get('code', '') for p in products})
+        is_single_type_multipack = product_types == 1 and total_items >= 2
+        arrangement = self.determine_arrangement(products)
+
+        # Step 2: Classify the ORIGINAL image with the vision model (image -> text,
+        # reliable). This is the only way to tell a GOOD single-type multipack
+        # (shows every unit) from a BAD one (one unit + a baked-in "xN" badge),
+        # since their catalogue metadata is identical.
+        verdict = None
+        if classifier and has_original:
+            verdict = await asyncio.to_thread(classifier.classify, original_image_path)
+
+        if verdict is not None:
+            reason = verdict.get('reason') or ''
+
+            # 2a. Placeholder / broken image — no usable photo to work from.
+            if not verdict['usable']:
+                issues = [
+                    f"No usable product image on Boots.com ({reason or 'placeholder'}). "
+                    + "Request an image from the supplier.",
+                ]
+                logger.info(f"Bundle {code}: supplier (no usable image: {reason})")
+                return self._result(code, title, 'supplier', original_image_path, None,
+                                    products, 0.3, issues, arrangement['reasoning'], False)
+
+            # 2b. Good original — needs no action, filter it out of the dashboard.
+            if not verdict['needs_fixing']:
+                logger.info(f"Bundle {code}: vision says image is fine — filtered out")
+                return None
+
+            # 2c. A baked-in multiplier badge on the only available photo. It can't
+            # be removed faithfully (PIL reproduces it, AI mangles it) and no clean
+            # source exists — route to Supplier Image Required.
+            if verdict['single_with_badge'] or verdict['has_badge']:
+                detail = reason or f'shows one unit with a "x{total_items}" multiplier badge'
+                issues = [
+                    f"Baked-in number badge — {detail}. It can't be removed cleanly; "
+                    + "request a badge-free image from the supplier.",
+                ]
+                logger.info(f"Bundle {code}: supplier (baked-in badge: {reason})")
+                return self._result(code, title, 'supplier', original_image_path, None,
+                                    products, 0.4, issues, arrangement['reasoning'], False)
+
+            # 2c'. A single-product multipack (one product type, qty >= 2) that the
+            # vision model still flagged. Boots shows these as a single unit, and no
+            # clean multi-unit photo exists — route to Supplier Image Required.
+            if is_single_type_multipack:
+                detail = reason or f'shown as one unit for a pack of {total_items}'
+                issues = [
+                    f"Single-product multipack (x{total_items}) — {detail}. "
+                    + "No clean multi-unit image on Boots.com; request one from the supplier.",
+                ]
+                logger.info(f"Bundle {code}: supplier (single-type multipack: {reason})")
+                return self._result(code, title, 'supplier', original_image_path, None,
+                                    products, 0.4, issues, arrangement['reasoning'], False)
+
+            # 2d. Poor quality / overlapping multi-type — regenerate from clean
+            # component photos where we can arrange them confidently.
+            issues = [reason or 'Poor-quality or cluttered original image.']
+            logger.info(f"Bundle {code}: regenerate (poor quality: {reason})")
+            return await self._regenerate_or_manual(
+                code, title, original_image_path, products, arrangement,
+                crawler, composer, uploads_dir, 0.5, issues,
+            )
+
+        # --- Structural fallback (no vision classifier available) ---
+        # Keep the catalogue rules working even without a vision model: download
+        # components, assess quality with PIL, and categorize structurally.
+        product_image_paths, product_quantities = await self._download_components(
+            crawler, products, uploads_dir,
+        )
         product_images_found = len(product_image_paths) > 0
 
-        # Step 2: Assess quality of the current bundle image (PIL work off the loop)
-        if original_image_path and os.path.exists(original_image_path):
+        if has_original:
             quality = await asyncio.to_thread(
                 self.assess_quality, original_image_path, product_image_paths,
             )
@@ -368,80 +499,54 @@ class BundleProcessor:
                 'needs_regeneration': True,
             }
 
-        # Step 3: Determine arrangement (shown as advisory info on the card)
-        arrangement = self.determine_arrangement(products)
-
-        has_original = bool(original_image_path and os.path.exists(original_image_path))
-        total_items = sum(int(p.get('quantity', 1)) for p in products)
-        product_types = len({p.get('code', '') for p in products})
-        is_multipack_with_badge = product_types == 1 and total_items >= 2
-
         can_compose = (
-            product_images_found and
-            not arrangement['manual_review'] and
-            arrangement['single_image']
+            product_images_found
+            and not arrangement['manual_review']
+            and arrangement['single_image']
         )
-        generated_image_path = None
-        needs_regeneration = False
 
-        if is_multipack_with_badge:
-            # Step 4a: A single-product-type multipack is shown by Boots as one
-            # product with a "x3" badge baked into the ONLY available product photo.
-            # That badge can't be removed faithfully (PIL can't; AI mangles it), so
-            # there is no clean image — route to Supplier Image Required.
+        if is_single_type_multipack:
             reason = (
                 f'Shown as one product with a "x{total_items}" badge baked into the only '
                 "available Boots.com image — no clean image found. "
                 "Request a badge-free image from the supplier."
             )
-            quality['issues'] = [*quality.get('issues', []), reason]
-            quality['score'] = round(min(quality.get('score', 0.8), 0.5), 2)
-            category = 'supplier'
-            logger.info(f"Bundle {code}: supplier (badged multipack, no clean image available)")
-        else:
-            # Step 4b: Multi-type bundle. A good original needs no action (filtered
-            # out). A genuinely poor original is regenerated from the clean component
-            # photos when we can arrange them confidently.
-            needs_regeneration = quality['needs_regeneration']
-            category, needs_regeneration = self.categorize_bundle(
-                bundle=bundle,
-                needs_regeneration=needs_regeneration,
-                product_images_found=product_images_found,
-                can_compose=can_compose,
-                has_original=has_original,
-            )
-            if category == 'ready' and needs_regeneration and can_compose and composer:
-                try:
-                    generated_image_path = os.path.join(uploads_dir, f"{code}_generated.jpg")
-                    await asyncio.to_thread(
-                        composer.compose_bundle_image,
-                        product_image_paths,
-                        generated_image_path,
-                        product_quantities,
-                    )
-                    logger.info(f"Generated composed image for {code}")
-                except Exception:
-                    logger.exception(f"Failed to generate image for {code}")
-                    category = 'manual'
-                    generated_image_path = None
-            # A fine, multi-product original needs no action — filter it out.
-            if category == 'ready' and not needs_regeneration:
-                logger.info(f"Bundle {code}: original is good — filtered out of dashboard")
-                return None
+            issues = [*quality.get('issues', []), reason]
+            logger.info(f"Bundle {code}: supplier (badged multipack, structural)")
+            return self._result(code, title, 'supplier', original_image_path, None, products,
+                                min(quality.get('score', 0.8), 0.5), issues,
+                                arrangement['reasoning'], False)
 
-        # Build result (only bundles that need action)
-        return {
-            'code': code,
-            'title': title,
-            'category': category,
-            'original_image': original_image_path,
-            'generated_image': generated_image_path,
-            'products': products,
-            'quality_score': quality['score'],
-            'quality_issues': quality['issues'],
-            'arrangement_reasoning': arrangement['reasoning'],
-            'needs_regeneration': needs_regeneration,
-        }
+        category, needs_regeneration = self.categorize_bundle(
+            bundle=bundle,
+            needs_regeneration=quality['needs_regeneration'],
+            product_images_found=product_images_found,
+            can_compose=can_compose,
+            has_original=has_original,
+        )
+        generated_image_path = None
+        if category == 'ready' and needs_regeneration and can_compose and composer:
+            try:
+                generated_image_path = os.path.join(uploads_dir, f"{code}_generated.jpg")
+                await asyncio.to_thread(
+                    composer.compose_bundle_image,
+                    product_image_paths,
+                    generated_image_path,
+                    product_quantities,
+                )
+                logger.info(f"Generated composed image for {code}")
+            except Exception:
+                logger.exception(f"Failed to generate image for {code}")
+                category = 'manual'
+                generated_image_path = None
+        # A fine, multi-product original needs no action — filter it out.
+        if category == 'ready' and not needs_regeneration:
+            logger.info(f"Bundle {code}: original is good — filtered out of dashboard")
+            return None
+
+        return self._result(code, title, category, original_image_path, generated_image_path,
+                            products, quality['score'], quality['issues'],
+                            arrangement['reasoning'], needs_regeneration)
 
     def _check_background_whiteness(self, img: Image.Image) -> float:
         """
