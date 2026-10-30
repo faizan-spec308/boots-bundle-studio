@@ -177,23 +177,25 @@ class ImageComposer:
 
     def measure_relative_heights(
         self, original_path: str, product_images: list[str],
-    ) -> tuple[list[float] | None, float]:
-        """Find each product's real height in the original bundle image via
-        multi-scale template matching, so a rebuild can preserve the size
-        differences (a small dropper stays smaller than a tall bottle).
+    ) -> tuple[list[float] | None, float, list[int] | None]:
+        """Find each product's real height AND horizontal position in the
+        original bundle image via multi-scale template matching, so a rebuild can
+        preserve both the size differences (a small dropper stays smaller than a
+        tall bottle) and the left-to-right order products appear in.
 
-        Returns (relative_heights, min_score). relative_heights is normalised so
-        the tallest product is 1.0, aligned with product_images. If anything
-        can't be measured or confidence is low, relative_heights is None and the
-        caller should fall back to Manual Review.
+        Returns (relative_heights, min_score, x_positions). relative_heights is
+        normalised so the tallest product is 1.0, aligned with product_images;
+        x_positions is each product's matched left-edge x (same order). If
+        anything can't be measured or confidence is low, returns (None, score,
+        None) and the caller should fall back to Manual Review.
         """
         try:
             import cv2
             import numpy as np
         except ImportError:
-            return None, 0.0
+            return None, 0.0, None
         if not original_path or not os.path.exists(original_path) or not product_images:
-            return None, 0.0
+            return None, 0.0, None
 
         def _to_cv(pil_img, max_dim):
             img = self._trim_whitespace(pil_img.convert("RGBA")).convert("RGB")
@@ -206,19 +208,20 @@ class ImageComposer:
         try:
             orig = _to_cv(Image.open(original_path), 500)
         except OSError:
-            return None, 0.0
+            return None, 0.0, None
         oh, ow = orig.shape[:2]
 
         heights: list[float] = []
+        xs: list[int] = []
         min_score = 1.0
         for path in product_images:
             if not path or not os.path.exists(path):
-                return None, 0.0
+                return None, 0.0, None
             try:
                 tmpl = _to_cv(Image.open(path), 500)
             except OSError:
-                return None, 0.0
-            best_score, best_h = -1.0, None
+                return None, 0.0, None
+            best_score, best_h, best_x = -1.0, None, 0
             th0 = tmpl.shape[0]
             # Try the product at a range of heights relative to the original.
             for pct in range(20, 100, 5):
@@ -229,18 +232,19 @@ class ImageComposer:
                     continue
                 resized = cv2.resize(tmpl, (tw, target_h), interpolation=cv2.INTER_AREA)
                 res = cv2.matchTemplate(orig, resized, cv2.TM_CCOEFF_NORMED)
-                _, maxv, _, _ = cv2.minMaxLoc(res)
+                _, maxv, _, maxloc = cv2.minMaxLoc(res)
                 if maxv > best_score:
-                    best_score, best_h = maxv, target_h
+                    best_score, best_h, best_x = maxv, target_h, int(maxloc[0])
             if best_h is None:
-                return None, 0.0
+                return None, 0.0, None
             heights.append(best_h)
+            xs.append(best_x)
             min_score = min(min_score, best_score)
 
         if min_score < self.MATCH_MIN_SCORE:
-            return None, min_score
+            return None, min_score, None
         tallest = max(heights) or 1
-        return [round(h / tallest, 3) for h in heights], min_score
+        return [round(h / tallest, 3) for h in heights], min_score, xs
 
     def _resize_product(self, img: Image.Image, target_height: int) -> Image.Image:
         """Scale a product to the target height, keeping aspect ratio. Always

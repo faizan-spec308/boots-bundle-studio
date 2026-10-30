@@ -425,6 +425,9 @@ class BundleProcessor:
         distinct = len({c['code'] for c in components})
         total_units = sum(c['quantity'] for c in components)
 
+        badge_implies_more = bool(
+            verdict and (verdict.get('single_with_badge') or verdict.get('has_badge')))
+
         # --- Single product type (multipack of identical units) ---
         if distinct == 1:
             if total_units > self.MAX_ITEMS_IN_ROW:
@@ -434,14 +437,25 @@ class BundleProcessor:
                     f"Multipack of {total_units} — too many units to show clearly in a single "
                     "image. Needs manual review (e.g. a representative shot or a roundel).")
             if total_units >= 2:
-                issues = [f"Shown as fewer units than the pack of {total_units} — "
-                          + f"rebuilt from the clean product photo to show all {total_units}."]
-                logger.info(f"Bundle {code}: rebuild multipack x{total_units}")
-                return await self._compose(code, title, original_image_path, products,
-                                           components, None, arrangement, composer,
-                                           uploads_dir, issues)
-            badge_implies_more = verdict and (
-                verdict.get('single_with_badge') or verdict.get('has_badge'))
+                # Only rebuild (duplicate the clean photo) when the original shows
+                # FEWER units than the pack — i.e. a multiplier badge / single unit.
+                # If the original already shows the units (no badge) and is just
+                # touching, duplicating one — often lower-quality — photo makes it
+                # worse, so keep the original.
+                if badge_implies_more:
+                    issues = [f"Shown as fewer units than the pack of {total_units} — "
+                              + f"rebuilt from the clean product photo to show all {total_units}."]
+                    logger.info(f"Bundle {code}: rebuild multipack x{total_units}")
+                    return await self._compose(code, title, original_image_path, products,
+                                               components, None, arrangement, composer,
+                                               uploads_dir, issues)
+                if verdict and verdict.get('poor_quality'):
+                    logger.info(f"Bundle {code}: manual (multipack, genuine quality issue)")
+                    return manual(
+                        "Multipack with an image-quality issue — needs manual review.")
+                logger.info(f"Bundle {code}: filtered (multipack already shows all units)")
+                return None
+            # qty < 2
             title_implies_pack = bool(_MULTIPACK_TITLE_RE.search(title or ''))
             if badge_implies_more or title_implies_pack:
                 logger.info(f"Bundle {code}: manual (multipack count unknown)")
@@ -462,9 +476,9 @@ class BundleProcessor:
                 f"{distinct} different products — too many to arrange clearly in a single "
                 "image. Needs manual review.")
 
-        rel, score = None, 0.0
+        rel, score, xs = None, 0.0, None
         if composer and original_image_path:
-            rel, score = await asyncio.to_thread(
+            rel, score, xs = await asyncio.to_thread(
                 composer.measure_relative_heights,
                 original_image_path, [c['path'] for c in components],
             )
@@ -477,8 +491,7 @@ class BundleProcessor:
                 verdict
                 and verdict.get('overlapping')
                 and not verdict.get('poor_quality')
-                and not verdict.get('has_badge')
-                and not verdict.get('single_with_badge')
+                and not badge_implies_more
             )
             if only_overlap:
                 logger.info(f"Bundle {code}: filtered (overlap only, can't improve, original fine)")
@@ -488,6 +501,12 @@ class BundleProcessor:
                 f"Couldn't confidently measure the products' real sizes from the original "
                 f"(best match {score:.0%}) — needs manual review to avoid wrong sizes or a "
                 "missing product.")
+        # Order the products left-to-right by where each one matched in the
+        # original, so the rebuild keeps the original arrangement (not the
+        # arbitrary catalogue order, which can flip products — e.g. No7).
+        order = sorted(range(len(components)), key=lambda i: xs[i])
+        components = [components[i] for i in order]
+        rel = [rel[i] for i in order]
         issues = [f"Rebuilt from {distinct} clean product photos, with each product's "
                   + "size preserved from the original and clear spacing added."]
         logger.info(f"Bundle {code}: rebuild {distinct} products, sizes preserved")
