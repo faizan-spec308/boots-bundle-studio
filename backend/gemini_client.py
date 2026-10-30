@@ -28,6 +28,7 @@ FIDELITY_PREAMBLE = """CRITICAL PRODUCT FIDELITY RULES — FOLLOW EXACTLY:
 - Preserve each product's original packaging, colours, labels, logos, text, and branding EXACTLY as shown.
 - Do NOT redesign, redraw, stylise, or reinterpret any product.
 - Do NOT stretch, compress, widen, shorten, or distort any packaging.
+- Preserve the RELATIVE SIZES of the products: a smaller product must stay smaller and a larger product larger, exactly as in the original — do NOT make all products the same size.
 - Do NOT invent, remove, duplicate, or alter product features.
 - Use the provided reference images as visual ground truth for product appearance.
 - Product accuracy takes precedence over visual creativity.

@@ -20,8 +20,19 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 
 from PIL import Image
+
+# Title hints that a single-product bundle is actually a multipack of several
+# identical units (e.g. "4 x ...", "4 packs", "pack of 3", "6 month supply").
+# Used only when Boots.com reports a single product with quantity < 2, to catch
+# cases where the real unit count is unknown and we should ask for manual review.
+_MULTIPACK_TITLE_RE = re.compile(
+    r"\b\d+\s*x\b|\b\d+\s*(?:pack|packs|pk|sachets?|tablets?|capsules?)\b"
+    r"|\bpack of\s*\d+\b|\b\d+\s*month(?:'?s)?\s*supply\b|\b(?:twin|triple)\s*pack\b",
+    re.IGNORECASE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -318,15 +329,21 @@ class BundleProcessor:
 
     async def _download_components(self, crawler, products, uploads_dir):
         """Download each component's product photo. Called ONLY when we may
-        regenerate, so fine bundles never pay for component downloads."""
-        paths: list = []
-        quantities: list = []
+        rebuild, so fine bundles never pay for component downloads.
+
+        Returns a list of {'code', 'path', 'quantity'} (one per product that has
+        an image), preserving product identity so the caller can tell how many
+        distinct products the bundle has and measure their sizes."""
+        components: list = []
         if not crawler:
             for product in products:
-                if product.get('image_path') and os.path.exists(product['image_path']):
-                    paths.append(product['image_path'])
-                    quantities.append(product.get('quantity', 1))
-            return paths, quantities
+                ip = product.get('image_path')
+                if ip and os.path.exists(ip):
+                    components.append({
+                        'code': product.get('code', ''), 'path': ip,
+                        'quantity': int(product.get('quantity', 1) or 1),
+                    })
+            return components
 
         async def _fetch(product):
             pcode = product.get('code', '')
@@ -335,46 +352,113 @@ class BundleProcessor:
             img = await crawler.download_product_image(
                 pcode, product.get('image_url'), uploads_dir,
             )
-            if img:
-                product['image_path'] = img
-            return (img, product.get('quantity', 1)) if img else None
+            if not img:
+                return None
+            product['image_path'] = img
+            return {'code': pcode, 'path': img, 'quantity': int(product.get('quantity', 1) or 1)}
 
         for res in await asyncio.gather(*(_fetch(p) for p in products)):
             if res:
-                paths.append(res[0])
-                quantities.append(res[1])
-        return paths, quantities
+                components.append(res)
+        return components
 
-    async def _regenerate_or_manual(self, code, title, original_image_path, products,
-                                    arrangement, crawler, composer, uploads_dir,
-                                    quality_score, issues):
-        """Download clean component photos and compose a new image if we can
-        arrange them confidently; otherwise route to manual review."""
-        product_image_paths, product_quantities = await self._download_components(
-            crawler, products, uploads_dir,
-        )
-        can_compose = (
-            bool(product_image_paths)
-            and not arrangement['manual_review']
-            and arrangement['single_image']
-        )
-        if can_compose and composer:
-            try:
-                generated_image_path = os.path.join(uploads_dir, f"{code}_generated.jpg")
-                await asyncio.to_thread(
-                    composer.compose_bundle_image,
-                    product_image_paths,
-                    generated_image_path,
-                    product_quantities,
-                )
-                logger.info(f"Generated composed image for {code}")
-                return self._result(code, title, 'ready', original_image_path,
-                                     generated_image_path, products, quality_score,
-                                     issues, arrangement['reasoning'], True)
-            except Exception:
-                logger.exception(f"Failed to generate image for {code}")
-        return self._result(code, title, 'manual', original_image_path, None, products,
-                             quality_score, issues, arrangement['reasoning'], True)
+    async def _compose(self, code, title, original_image_path, products, components,
+                       relative_heights, arrangement, composer, uploads_dir, issues):
+        """Compose the bundle from clean component photos. Falls back to Manual
+        Review if the arrangement is too complex or composition fails."""
+        if not composer or arrangement.get('manual_review') or not arrangement.get('single_image'):
+            return self._result(code, title, 'manual', original_image_path, None, products,
+                                 0.4, issues, arrangement['reasoning'], True)
+        paths = [c['path'] for c in components]
+        quantities = [c['quantity'] for c in components]
+        try:
+            generated_image_path = os.path.join(uploads_dir, f"{code}_generated.jpg")
+            await asyncio.to_thread(
+                composer.compose_bundle_image, paths, generated_image_path, quantities,
+                relative_heights=relative_heights,
+            )
+            logger.info(f"Composed image for {code} (sizes {'preserved' if relative_heights else 'uniform'})")
+            return self._result(code, title, 'ready', original_image_path, generated_image_path,
+                                 products, 0.6, issues, arrangement['reasoning'], True)
+        except Exception:
+            logger.exception(f"Compose failed for {code}")
+            return self._result(code, title, 'manual', original_image_path, None, products,
+                                 0.4, issues, arrangement['reasoning'], True)
+
+    async def _rebuild_from_components(self, code, title, original_image_path, products,
+                                       components, arrangement, composer, uploads_dir, verdict):
+        """Decide how to rebuild a bundle that the vision model flagged.
+
+        - No clean components available -> Supplier Image Required.
+        - Single product type: a multipack of identical units. Rebuild showing
+          the product `quantity` times when the count is reliable; if a badge
+          implies several but the count is unknown (e.g. "4x" but WCS says 1) ->
+          Manual Review.
+        - Multiple distinct products: measure each product's real size from the
+          original and rebuild preserving those sizes. If sizes can't be measured
+          confidently (occlusion / heavy overlap / missing product) -> Manual.
+        """
+        reason = (verdict or {}).get('reason') or ''
+
+        def manual(msg):
+            return self._result(code, title, 'manual', original_image_path, None, products,
+                                 0.4, [msg], arrangement['reasoning'], True)
+
+        if not components:
+            issues = [
+                f"{reason or 'Image needs fixing'}. No clean component images on "
+                + "Boots.com to rebuild from — request an image from the supplier.",
+            ]
+            logger.info(f"Bundle {code}: supplier (no clean components)")
+            return self._result(code, title, 'supplier', original_image_path, None, products,
+                                 0.3, issues, arrangement['reasoning'], False)
+
+        distinct = len({c['code'] for c in components})
+        total_units = sum(c['quantity'] for c in components)
+
+        # --- Single product type (multipack of identical units) ---
+        if distinct == 1:
+            if total_units >= 2:
+                issues = [f"Shown as fewer units than the pack of {total_units} — "
+                          + f"rebuilt from the clean product photo to show all {total_units}."]
+                logger.info(f"Bundle {code}: rebuild multipack x{total_units}")
+                return await self._compose(code, title, original_image_path, products,
+                                           components, None, arrangement, composer,
+                                           uploads_dir, issues)
+            badge_implies_more = verdict and (
+                verdict.get('single_with_badge') or verdict.get('has_badge'))
+            title_implies_pack = bool(_MULTIPACK_TITLE_RE.search(title or ''))
+            if badge_implies_more or title_implies_pack:
+                logger.info(f"Bundle {code}: manual (multipack count unknown)")
+                return manual(
+                    "Looks like a multipack of one product, but Boots.com reports only a "
+                    "single unit so the real count is unknown — needs manual review to show "
+                    "the correct number of items.")
+            # One product, quality issue only -> rebuild from the clean photo.
+            issues = ["Rebuilt from the clean Boots.com product photo on a white background."]
+            return await self._compose(code, title, original_image_path, products,
+                                       components, None, arrangement, composer,
+                                       uploads_dir, issues)
+
+        # --- Multiple distinct products: preserve real sizes from the original ---
+        rel, score = None, 0.0
+        if composer and original_image_path:
+            rel, score = await asyncio.to_thread(
+                composer.measure_relative_heights,
+                original_image_path, [c['path'] for c in components],
+            )
+        if rel is None:
+            logger.info(f"Bundle {code}: manual (couldn't measure sizes, score={score:.2f})")
+            return manual(
+                f"Couldn't confidently measure the products' real sizes from the original "
+                f"(best match {score:.0%}) — needs manual review to avoid wrong sizes or a "
+                "missing product.")
+        issues = [f"Rebuilt from {distinct} clean product photos, with each product's "
+                  + "size preserved from the original and clear spacing added."]
+        logger.info(f"Bundle {code}: rebuild {distinct} products, sizes preserved")
+        return await self._compose(code, title, original_image_path, products,
+                                   components, rel, arrangement, composer,
+                                   uploads_dir, issues)
 
     async def _process_one(self, bundle: dict, crawler, composer, uploads_dir: str,
                            classifier=None) -> dict | None:
@@ -445,47 +529,23 @@ class BundleProcessor:
                 logger.info(f"Bundle {code}: vision says image is fine — filtered out")
                 return None
 
-            # 2c. A baked-in multiplier badge on the only available photo. It can't
-            # be removed faithfully (PIL reproduces it, AI mangles it) and no clean
-            # source exists — route to Supplier Image Required.
-            if verdict['single_with_badge'] or verdict['has_badge']:
-                detail = reason or f'shows one unit with a "x{total_items}" multiplier badge'
-                issues = [
-                    f"Baked-in number badge — {detail}. It can't be removed cleanly; "
-                    + "request a badge-free image from the supplier.",
-                ]
-                logger.info(f"Bundle {code}: supplier (baked-in badge: {reason})")
-                return self._result(code, title, 'supplier', original_image_path, None,
-                                    products, 0.4, issues, arrangement['reasoning'], False)
-
-            # 2c'. A single-product multipack (one product type, qty >= 2) that the
-            # vision model still flagged. Boots shows these as a single unit, and no
-            # clean multi-unit photo exists — route to Supplier Image Required.
-            if is_single_type_multipack:
-                detail = reason or f'shown as one unit for a pack of {total_items}'
-                issues = [
-                    f"Single-product multipack (x{total_items}) — {detail}. "
-                    + "No clean multi-unit image on Boots.com; request one from the supplier.",
-                ]
-                logger.info(f"Bundle {code}: supplier (single-type multipack: {reason})")
-                return self._result(code, title, 'supplier', original_image_path, None,
-                                    products, 0.4, issues, arrangement['reasoning'], False)
-
-            # 2d. Poor quality / overlapping multi-type — regenerate from clean
-            # component photos where we can arrange them confidently.
-            issues = [reason or 'Poor-quality or cluttered original image.']
-            logger.info(f"Bundle {code}: regenerate (poor quality: {reason})")
-            return await self._regenerate_or_manual(
-                code, title, original_image_path, products, arrangement,
-                crawler, composer, uploads_dir, 0.5, issues,
+            # 2c. Needs fixing — rebuild from clean component photos. A badge no
+            # longer forces Supplier: we rebuild the image from scratch (multipacks
+            # show the product the right number of times; multi-product bundles keep
+            # each product's real size measured from the original). Supplier/Manual
+            # are used only when we can't rebuild faithfully.
+            components = await self._download_components(crawler, products, uploads_dir)
+            return await self._rebuild_from_components(
+                code, title, original_image_path, products, components,
+                arrangement, composer, uploads_dir, verdict,
             )
 
         # --- Structural fallback (no vision classifier available) ---
         # Keep the catalogue rules working even without a vision model: download
         # components, assess quality with PIL, and categorize structurally.
-        product_image_paths, product_quantities = await self._download_components(
-            crawler, products, uploads_dir,
-        )
+        components = await self._download_components(crawler, products, uploads_dir)
+        product_image_paths = [c['path'] for c in components]
+        product_quantities = [c['quantity'] for c in components]
         product_images_found = len(product_image_paths) > 0
 
         if has_original:

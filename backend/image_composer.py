@@ -35,6 +35,7 @@ class ImageComposer:
         quantities: list[int] | None = None,
         gap: int | None = None,
         max_height: int | None = None,
+        relative_heights: list[float] | None = None,
     ) -> str:
         """
         Compose a bundle image from individual product photos.
@@ -45,6 +46,11 @@ class ImageComposer:
             quantities: List of quantities for each product (e.g. [3, 1] = 3 of product A, 1 of product B)
             gap: Gap between products in pixels (default: 60)
             max_height: Max height for products in pixels (default: 1600)
+            relative_heights: Optional per-product relative heights (aligned with
+                product_images), e.g. [1.0, 0.79, 0.53], so the composed products
+                keep the real-world size differences measured from the original
+                bundle image. When omitted, all products are scaled to one height
+                (correct for identical multipack units).
 
         Returns:
             The output file path
@@ -54,40 +60,52 @@ class ImageComposer:
         if max_height is None:
             max_height = self.MAX_PRODUCT_HEIGHT
 
-        # Expand product images based on quantities
+        # Expand product images (and their relative heights) based on quantities
         expanded_images = []
+        expanded_rel: list[float] = []
         if quantities:
-            for img_path, qty in zip(product_images, quantities):
+            for i, (img_path, qty) in enumerate(zip(product_images, quantities)):
+                rel = relative_heights[i] if relative_heights else 1.0
                 for _ in range(qty):
                     expanded_images.append(img_path)
+                    expanded_rel.append(rel)
         else:
             expanded_images = product_images.copy()
+            expanded_rel = list(relative_heights) if relative_heights else [1.0] * len(expanded_images)
 
         # Check if we need the roundel (6+ identical items)
         use_roundel = False
         if len(expanded_images) >= 6 and len(set(expanded_images)) == 1:
             use_roundel = True
             expanded_images = [expanded_images[0]]  # Just use one image
+            expanded_rel = [1.0]
 
-        # Load and process all product images
+        # Load and process all product images (keeping each image's relative height)
         processed_products = []
-        for img_path in expanded_images:
+        processed_rel = []
+        for img_path, rel in zip(expanded_images, expanded_rel):
             if not os.path.exists(img_path):
                 print(f"WARNING: Product image not found: {img_path}")
                 continue
             img = Image.open(img_path).convert("RGBA")
             processed_products.append(img)
+            processed_rel.append(rel)
 
         if not processed_products:
             raise ValueError("No valid product images found")
 
-        # Trim surrounding whitespace so each product fills its frame, then scale
-        # every product to a common target height (~75% of the canvas) so products
-        # stay large instead of tiny in a sea of white. Fidelity is preserved:
-        # uniform scaling only, exact product pixels — just the white margins removed.
+        # Trim surrounding whitespace so each product fills its frame, then scale.
+        # The tallest product reaches the target height (~75% of the canvas); the
+        # others are scaled by their relative height so real-world size differences
+        # measured from the original are preserved. Fidelity is kept: uniform
+        # per-product scaling, exact product pixels — only white margins removed.
         trimmed = [self._trim_whitespace(img) for img in processed_products]
         target_height = min(int(self.CANVAS_SIZE * 0.75), max_height)  # ~1500px
-        resized_products = [self._resize_product(img, target_height) for img in trimmed]
+        max_rel = max(processed_rel) or 1.0
+        resized_products = [
+            self._resize_product(img, max(40, int(target_height * (rel / max_rel))))
+            for img, rel in zip(trimmed, processed_rel)
+        ]
 
         # Single horizontal row (shelf layout). If the row is wider than the canvas,
         # scale all products down proportionally so they still fit with padding.
@@ -150,6 +168,79 @@ class ImageComposer:
         canvas.save(output_path, "JPEG", quality=95)
         print(f"Composed bundle image saved to: {output_path}")
         return output_path
+
+    # Minimum template-match confidence to trust the measured relative sizes.
+    # Below this, the component photo couldn't be located confidently in the
+    # original (different angle, occlusion, heavy overlap) — caller should route
+    # the bundle to Manual Review rather than compose at a guessed size.
+    MATCH_MIN_SCORE = 0.5
+
+    def measure_relative_heights(
+        self, original_path: str, product_images: list[str],
+    ) -> tuple[list[float] | None, float]:
+        """Find each product's real height in the original bundle image via
+        multi-scale template matching, so a rebuild can preserve the size
+        differences (a small dropper stays smaller than a tall bottle).
+
+        Returns (relative_heights, min_score). relative_heights is normalised so
+        the tallest product is 1.0, aligned with product_images. If anything
+        can't be measured or confidence is low, relative_heights is None and the
+        caller should fall back to Manual Review.
+        """
+        try:
+            import cv2
+            import numpy as np
+        except ImportError:
+            return None, 0.0
+        if not original_path or not os.path.exists(original_path) or not product_images:
+            return None, 0.0
+
+        def _to_cv(pil_img, max_dim):
+            img = self._trim_whitespace(pil_img.convert("RGBA")).convert("RGB")
+            scale = min(1.0, max_dim / max(img.width, img.height))
+            if scale < 1.0:
+                img = img.resize((max(1, int(img.width * scale)),
+                                  max(1, int(img.height * scale))), Image.LANCZOS)
+            return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+        try:
+            orig = _to_cv(Image.open(original_path), 500)
+        except OSError:
+            return None, 0.0
+        oh, ow = orig.shape[:2]
+
+        heights: list[float] = []
+        min_score = 1.0
+        for path in product_images:
+            if not path or not os.path.exists(path):
+                return None, 0.0
+            try:
+                tmpl = _to_cv(Image.open(path), 500)
+            except OSError:
+                return None, 0.0
+            best_score, best_h = -1.0, None
+            th0 = tmpl.shape[0]
+            # Try the product at a range of heights relative to the original.
+            for pct in range(20, 100, 5):
+                target_h = int(oh * pct / 100)
+                scale = target_h / th0
+                tw = int(tmpl.shape[1] * scale)
+                if target_h < 15 or target_h > oh or tw < 8 or tw > ow:
+                    continue
+                resized = cv2.resize(tmpl, (tw, target_h), interpolation=cv2.INTER_AREA)
+                res = cv2.matchTemplate(orig, resized, cv2.TM_CCOEFF_NORMED)
+                _, maxv, _, _ = cv2.minMaxLoc(res)
+                if maxv > best_score:
+                    best_score, best_h = maxv, target_h
+            if best_h is None:
+                return None, 0.0
+            heights.append(best_h)
+            min_score = min(min_score, best_score)
+
+        if min_score < self.MATCH_MIN_SCORE:
+            return None, min_score
+        tallest = max(heights) or 1
+        return [round(h / tallest, 3) for h in heights], min_score
 
     def _resize_product(self, img: Image.Image, target_height: int) -> Image.Image:
         """Scale a product to the target height, keeping aspect ratio. Always
