@@ -230,6 +230,30 @@ body {
   to { transform: rotate(360deg); }
 }
 
+/* Loading messages */
+.loading-phase {
+  font-size: 1.15rem;
+  font-weight: 600;
+  color: var(--boots-blue);
+  margin: 0 0 6px;
+  text-align: center;
+}
+
+.loading-tip {
+  font-size: 0.9rem;
+  color: var(--gray-500);
+  margin: 0 0 18px;
+  text-align: center;
+  max-width: 440px;
+  min-height: 1.2em;
+  animation: tip-fade 0.5s ease;
+}
+
+@keyframes tip-fade {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
 /* Load progress */
 .progress-wrap {
   width: 100%;

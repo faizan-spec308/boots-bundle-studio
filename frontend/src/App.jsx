@@ -12,7 +12,25 @@ export default function App() {
   const [liveTotal, setLiveTotal] = useState(0)
   const [activeTab, setActiveTab] = useState('ready')
   const [backendOnline, setBackendOnline] = useState(false)
+  const [tipIndex, setTipIndex] = useState(0)
   const pollRef = useRef(null)
+
+  // Light status lines that rotate under the real phase while loading, so the
+  // wait feels alive rather than frozen. Professional, with a bit of character.
+  const DOWNLOAD_TIPS = [
+    'Waking up Monday.com and asking nicely for the data…',
+    'Fetching a rather large spreadsheet — worth the wait…',
+    'Cross-referencing the live bundles (matchmaking, basically)…',
+    'Good things take about a minute…',
+  ]
+  const PROCESS_TIPS = [
+    'Tracking down clean product photos on Boots.com…',
+    'Asking the AI to spot sneaky multiplier badges…',
+    'Measuring each product so nothing comes out supersized…',
+    'Giving every product a little room to breathe…',
+    'Quietly skipping the bundles that are already perfect…',
+    'Rebuilding only what actually needs a touch-up…',
+  ]
 
   // Poll the backend health every few seconds so the badge recovers once a
   // cold-started instance wakes up (the free tier can take ~50s).
@@ -32,6 +50,13 @@ export default function App() {
     loadBundles(false)
     return () => { if (pollRef.current) clearTimeout(pollRef.current) }
   }, [])
+
+  // Rotate the light status line every few seconds while loading.
+  useEffect(() => {
+    if (!loading) return
+    const id = setInterval(() => setTipIndex(i => i + 1), 3200)
+    return () => clearInterval(id)
+  }, [loading])
 
   function clearPoll() {
     if (pollRef.current) { clearTimeout(pollRef.current); pollRef.current = null }
@@ -146,8 +171,13 @@ export default function App() {
         {loading && bundles.length === 0 ? (
           <div className="loading-state">
             <div className="spinner"></div>
-            <p>{progress?.phase || 'Fetching bundles from Monday.com…'}</p>
-            {pct !== null ? (
+            <p className="loading-phase">{progress?.phase || 'Getting things ready…'}</p>
+            <p className="loading-tip" key={tipIndex}>
+              {(pct !== null ? PROCESS_TIPS : DOWNLOAD_TIPS)[
+                tipIndex % (pct !== null ? PROCESS_TIPS.length : DOWNLOAD_TIPS.length)
+              ]}
+            </p>
+            {pct !== null && (
               <div className="progress-wrap">
                 <div className="progress-bar">
                   <div className="progress-fill" style={{ width: `${pct}%` }}></div>
@@ -157,10 +187,6 @@ export default function App() {
                   {progress.live_total ? ` · ${progress.live_total.toLocaleString()} confirmed live` : ''}
                 </p>
               </div>
-            ) : (
-              <p className="progress-text">
-                Downloading data from Monday.com (large file — this can take ~1 minute)…
-              </p>
             )}
             {progress && (
               <p className="progress-elapsed">

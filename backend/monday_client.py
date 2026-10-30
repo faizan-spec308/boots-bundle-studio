@@ -359,22 +359,22 @@ class MondayClient:
                 raise FileNotFoundError(
                     f"use_local_files=True but these files are missing: {missing}"
                 )
-            phase("Using local files (skipping Monday.com download)…")
+            phase("Reading the latest files from Monday.com…")
         else:
             # Download only when asked to refresh or when the cached files are missing
             if refresh or not os.path.exists(core_path):
-                phase("Downloading Core Line List (~40MB) from Monday.com…")
+                phase("Fetching the Core Line List from Monday.com…")
                 await self.fetch_core_line_list(core_path)
             if refresh or not os.path.exists(report_path):
-                phase("Downloading 2am report from Monday.com…")
+                phase("Fetching the latest live-products report…")
                 await self.fetch_2am_report(report_path)
 
         # Parse off the event loop (these block on large spreadsheets)
-        phase("Parsing Core Line List…")
+        phase("Reading the product catalogue…")
         virtual_bundles = await asyncio.to_thread(self.parse_core_line_list, core_path)
-        phase("Parsing 2am report…")
+        phase("Checking which products are live…")
         live_codes = await asyncio.to_thread(self.parse_2am_report, report_path)
-        phase("Cross-referencing live bundles…")
+        phase("Matching live products to bundles…")
 
         # Cross-reference: a bundle is live if its Article Number (match_code)
         # appears in the 2am report's BTC codes.

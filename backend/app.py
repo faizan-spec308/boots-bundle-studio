@@ -394,7 +394,7 @@ async def _load_bundles_job(refresh: bool, limit: int, force: bool) -> None:
         else:
             batch = confirmed
         _bundle_load.update(
-            phase="Classifying images & composing where needed",
+            phase="Reviewing bundle images & rebuilding where needed…",
             total=len(batch), processed=0,
         )
         logger.info(f"Resolved {len(confirmed)} bundles (processing {len(batch)})")
@@ -455,7 +455,7 @@ async def get_bundles(
 
     # Start a new background load (first load, retry after error, refresh, or force).
     _bundle_load.update(
-        status="loading", phase="Starting…", processed=0, total=0,
+        status="loading", phase="Warming up…", processed=0, total=0,
         error=None, started_at=time.time(), finished_at=None,
     )
     _bundle_task = asyncio.create_task(
