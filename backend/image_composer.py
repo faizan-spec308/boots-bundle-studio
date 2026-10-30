@@ -173,7 +173,7 @@ class ImageComposer:
     # Below this, the component photo couldn't be located confidently in the
     # original (different angle, occlusion, heavy overlap) — caller should route
     # the bundle to Manual Review rather than compose at a guessed size.
-    MATCH_MIN_SCORE = 0.5
+    MATCH_MIN_SCORE = 0.60
 
     def measure_relative_heights(
         self, original_path: str, product_images: list[str],

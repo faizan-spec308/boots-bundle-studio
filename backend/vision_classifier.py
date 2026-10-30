@@ -27,7 +27,7 @@ _PROMPT = (
     "You are auditing a Boots.com product-bundle image for an e-commerce catalogue. "
     "Reply with ONLY compact JSON (no markdown fences), exactly these keys:\n"
     '{"usable_product_image":bool,"has_number_badge":bool,"shows_one_unit_with_badge":bool,'
-    '"poor_quality_or_overlapping":bool,"needs_fixing":bool,"reason":"<=14 words"}\n'
+    '"products_overlapping":bool,"poor_image_quality":bool,"needs_fixing":bool,"reason":"<=14 words"}\n'
     "Definitions:\n"
     "- usable_product_image: false if it is a placeholder / loading spinner / 'image coming soon' "
     "/ broken or missing image rather than a real product photo.\n"
@@ -39,10 +39,13 @@ _PROMPT = (
     "sticker, set this false.\n"
     "- shows_one_unit_with_badge: only ONE product unit is visible, yet an overlaid multiplier badge "
     "(as defined above) implies several. If two or more distinct product units are visible, set false.\n"
-    "- poor_quality_or_overlapping: blurry, low-resolution, cluttered, a non-white background, or products "
-    "touching/overlapping with no visible gap.\n"
-    "- needs_fixing: true if (has_number_badge OR shows_one_unit_with_badge OR poor_quality_or_overlapping) "
-    "AND usable_product_image is true. If usable_product_image is false, set needs_fixing to false."
+    "- products_overlapping: the products touch or overlap with no clear gap between them, but the photo "
+    "is otherwise clean (sharp, white background). This is purely a spacing issue.\n"
+    "- poor_image_quality: a GENUINE image-quality problem — blurry, low-resolution, pixelated, a "
+    "watermark, heavy clutter, or a non-white / photographic / busy background. Products merely touching "
+    "on a clean white background is NOT poor_image_quality (use products_overlapping for that).\n"
+    "- needs_fixing: true if (has_number_badge OR shows_one_unit_with_badge OR products_overlapping OR "
+    "poor_image_quality) AND usable_product_image is true. If usable_product_image is false, set false."
 )
 
 
@@ -79,7 +82,8 @@ class VisionClassifier:
                 "usable": usable,
                 "has_badge": bool(d.get("has_number_badge", False)),
                 "single_with_badge": bool(d.get("shows_one_unit_with_badge", False)),
-                "poor_quality": bool(d.get("poor_quality_or_overlapping", False)),
+                "overlapping": bool(d.get("products_overlapping", False)),
+                "poor_quality": bool(d.get("poor_image_quality", False)),
                 "needs_fixing": usable and bool(d.get("needs_fixing", False)),
                 "reason": str(d.get("reason", ""))[:140],
             }

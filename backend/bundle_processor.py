@@ -42,6 +42,10 @@ class BundleProcessor:
     Processes bundle data: quality assessment, categorization, and arrangement decisions.
     """
 
+    # The most items (multipack units or distinct products) we'll line up in one
+    # clean image. Anything larger goes to Manual Review instead.
+    MAX_ITEMS_IN_ROW = 5
+
     def __init__(self):
         pass
 
@@ -396,7 +400,12 @@ class BundleProcessor:
           Manual Review.
         - Multiple distinct products: measure each product's real size from the
           original and rebuild preserving those sizes. If sizes can't be measured
-          confidently (occlusion / heavy overlap / missing product) -> Manual.
+          confidently (occlusion / heavy overlap / missing product) -> Manual,
+          unless the only flaw was slight overlap, in which case the original is
+          fine as-is and the bundle is filtered out.
+
+        General rule: we never try to line up more than MAX_ITEMS_IN_ROW items in
+        a single image — larger packs go to Manual Review instead.
         """
         reason = (verdict or {}).get('reason') or ''
 
@@ -418,6 +427,12 @@ class BundleProcessor:
 
         # --- Single product type (multipack of identical units) ---
         if distinct == 1:
+            if total_units > self.MAX_ITEMS_IN_ROW:
+                # Too many units to line up in one clean image -> manual review.
+                logger.info(f"Bundle {code}: manual (pack of {total_units} too large)")
+                return manual(
+                    f"Multipack of {total_units} — too many units to show clearly in a single "
+                    "image. Needs manual review (e.g. a representative shot or a roundel).")
             if total_units >= 2:
                 issues = [f"Shown as fewer units than the pack of {total_units} — "
                           + f"rebuilt from the clean product photo to show all {total_units}."]
@@ -441,6 +456,12 @@ class BundleProcessor:
                                        uploads_dir, issues)
 
         # --- Multiple distinct products: preserve real sizes from the original ---
+        if distinct > self.MAX_ITEMS_IN_ROW:
+            logger.info(f"Bundle {code}: manual ({distinct} products too many for one row)")
+            return manual(
+                f"{distinct} different products — too many to arrange clearly in a single "
+                "image. Needs manual review.")
+
         rel, score = None, 0.0
         if composer and original_image_path:
             rel, score = await asyncio.to_thread(
@@ -448,6 +469,20 @@ class BundleProcessor:
                 original_image_path, [c['path'] for c in components],
             )
         if rel is None:
+            # We can't rebuild faithfully. If the ONLY problem was slight overlap,
+            # the original is acceptable as-is — leave it (filter out) rather than
+            # cluttering Manual Review. A genuine quality problem or a badge still
+            # needs a human.
+            only_overlap = (
+                verdict
+                and verdict.get('overlapping')
+                and not verdict.get('poor_quality')
+                and not verdict.get('has_badge')
+                and not verdict.get('single_with_badge')
+            )
+            if only_overlap:
+                logger.info(f"Bundle {code}: filtered (overlap only, can't improve, original fine)")
+                return None
             logger.info(f"Bundle {code}: manual (couldn't measure sizes, score={score:.2f})")
             return manual(
                 f"Couldn't confidently measure the products' real sizes from the original "
