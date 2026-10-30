@@ -478,7 +478,8 @@ class BundleProcessor:
             "single row with a clear white gap between each one — no product may touch "
             "or overlap another. Show every product in full, keep each one's size, "
             "shape, colours and label text exactly as they are, and keep the plain "
-            f"white background.{badge_clause}"
+            "pure-white background. Do NOT add any shadows, reflections or other "
+            f"effects under or around the products.{badge_clause}"
         )
         prompts = [
             base_prompt,

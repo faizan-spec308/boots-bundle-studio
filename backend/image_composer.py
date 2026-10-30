@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import os
 
-from PIL import Image, ImageChops, ImageDraw, ImageFilter
+from PIL import Image, ImageChops
 
 
 class ImageComposer:
@@ -21,9 +21,6 @@ class ImageComposer:
     BACKGROUND_COLOR = (255, 255, 255)
     MAX_PRODUCT_HEIGHT = 1500  # 75% of canvas — products fill the canvas, not tiny
     DEFAULT_GAP = 60  # Default gap between products in pixels
-    SHADOW_OPACITY = 120
-    SHADOW_BLUR = 25
-    SHADOW_HEIGHT = 40
 
     def __init__(self, roundel_path: str | None = None):
         self.roundel_path = roundel_path
@@ -124,34 +121,21 @@ class ImageComposer:
         max_h = max(i.height for i in resized_products)
         baseline = self.CANVAS_SIZE // 2 + max_h // 2
 
-        # Create white canvas + shadow layer
-        canvas = Image.new("RGBA", (self.CANVAS_SIZE, self.CANVAS_SIZE), self.BACKGROUND_COLOR + (255,))
-        shadow_layer = Image.new("RGBA", (self.CANVAS_SIZE, self.CANVAS_SIZE), (0, 0, 0, 0))
-        shadow_draw = ImageDraw.Draw(shadow_layer)
+        # Plain white canvas — products only, no added shadows or effects.
+        canvas = Image.new("RGB", (self.CANVAS_SIZE, self.CANVAS_SIZE), self.BACKGROUND_COLOR)
 
         placements = []
         current_x = start_x
         for img in resized_products:
             placements.append((img, current_x, baseline - img.height))
-            # contact shadow: an ellipse 20% wider than the product, centred under it
-            shadow_w = int(img.width * 1.2)
-            shadow_x = current_x - (shadow_w - img.width) // 2
-            shadow_draw.ellipse(
-                [shadow_x, baseline - self.SHADOW_HEIGHT // 2,
-                 shadow_x + shadow_w, baseline + self.SHADOW_HEIGHT // 2],
-                fill=(0, 0, 0, self.SHADOW_OPACITY),
-            )
             current_x += img.width + gap
 
-        # Blur the shadow layer, then lay the products over it.
-        shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=self.SHADOW_BLUR))
-        canvas = Image.alpha_composite(canvas, shadow_layer).convert("RGB")
         for img, px, py in placements:
             # Multiply-blend instead of pasting: a product photo's white background
-            # then lets the shadow show through (no white "box" edge around the
-            # product), while every product pixel — white packaging included —
-            # stays intact. Near-white background noise is snapped to pure white
-            # first so it can't tint the canvas.
+            # merges seamlessly with the canvas (no white "box" edges where crops
+            # meet), while every product pixel — white packaging included — stays
+            # intact. Near-white background noise is snapped to pure white first
+            # so it can't tint the canvas.
             flat = Image.new("RGB", img.size, self.BACKGROUND_COLOR)
             flat.paste(img, (0, 0), img if img.mode == "RGBA" else None)
             # (Only the last few levels — white packaging often has faint grey
