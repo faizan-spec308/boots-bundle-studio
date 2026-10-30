@@ -51,7 +51,7 @@ load_dotenv()
 # Import our modules
 from boots_crawler import BootsCrawler
 from bundle_processor import BundleProcessor
-from gemini_client import GeminiClient
+from gemini_client import GeminiClient, GeminiUnavailable
 from image_composer import ImageComposer
 from monday_client import MondayClient
 from vision_classifier import VisionClassifier
@@ -683,6 +683,10 @@ async def edit_image(request: EditRequest):
 
     except HTTPException:
         raise
+    except GeminiUnavailable as e:
+        # Credits used up / bad key: tell the reviewer plainly, don't 500.
+        logger.warning(f"Gemini unavailable for edit {request.bundle_code}: {e}")
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         logger.exception("Failed to edit image")
         raise HTTPException(status_code=500, detail=f"Image edit failed: {e!s}")

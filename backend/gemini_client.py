@@ -41,6 +41,21 @@ class GeminiError(Exception):
     """Raised when a Gemini image operation fails after all retries."""
 
 
+class GeminiUnavailable(GeminiError):
+    """Gemini can't be used at all right now (credits used up / invalid key).
+    Retrying is pointless, so this is raised immediately with a clear message."""
+
+
+def _raise_if_unavailable(e: Exception) -> None:
+    msg = str(e)
+    low = msg.lower()
+    if "402" in msg or "credits are depleted" in low or "api key not valid" in low:
+        raise GeminiUnavailable(
+            "Gemini AI is unavailable — the API credits are used up (or the key is "
+            "invalid). Top up at https://ai.studio/projects and try again."
+        ) from e
+
+
 class GeminiClient:
     """
     Client for Google Gemini API image editing operations.
@@ -161,6 +176,7 @@ class GeminiClient:
                 return output_path
 
             except Exception as e:
+                _raise_if_unavailable(e)  # no point retrying a permanent failure
                 logger.warning(f"Gemini edit attempt {attempt} failed: {e}")
                 if attempt == max_retries:
                     raise GeminiError(
@@ -221,6 +237,7 @@ class GeminiClient:
                 return output_path
 
             except Exception as e:
+                _raise_if_unavailable(e)
                 logger.warning(f"Gemini generate attempt {attempt} failed: {e}")
                 if attempt == max_retries:
                     raise GeminiError(

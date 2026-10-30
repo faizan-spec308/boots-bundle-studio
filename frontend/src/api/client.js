@@ -6,6 +6,23 @@
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 
 /**
+ * Build a readable error from a failed response: prefer the backend's own
+ * explanation (FastAPI's `detail`) over the bare HTTP status text, so the UI can
+ * say e.g. "Gemini credits are used up" instead of "Internal Server Error".
+ */
+async function errorFrom(res, action) {
+  try {
+    const body = await res.json()
+    if (body && body.detail) {
+      return typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail)
+    }
+  } catch {
+    // not JSON — fall through
+  }
+  return `${action} (${res.status} ${res.statusText})`
+}
+
+/**
  * Fetch bundles from the backend (it loads in the background; poll until ready).
  * mode: ''          — current results (or start the first load)
  *       'reprocess' — re-run the latest rules on the bundles already shown
@@ -14,7 +31,7 @@ const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 export async function fetchBundles(mode = '') {
   const url = `${API_BASE}/api/bundles${mode ? `?${mode}=true` : ''}`
   const res = await fetch(url)
-  if (!res.ok) throw new Error(`Failed to fetch bundles: ${res.statusText}`)
+  if (!res.ok) throw new Error(await errorFrom(res, 'Failed to fetch bundles'))
   return res.json()
 }
 
@@ -27,7 +44,7 @@ export async function generateImage(bundleCode, productImagePaths, quantities = 
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ bundle_code: bundleCode, product_image_paths: productImagePaths, quantities, gap }),
   })
-  if (!res.ok) throw new Error(`Generation failed: ${res.statusText}`)
+  if (!res.ok) throw new Error(await errorFrom(res, 'Generation failed'))
   return res.json()
 }
 
@@ -46,7 +63,7 @@ export async function editImage(bundleCode, imagePath, editPrompt, referenceImag
       reference_image_paths: referenceImagePaths,
     }),
   })
-  if (!res.ok) throw new Error(`Edit failed: ${res.statusText}`)
+  if (!res.ok) throw new Error(await errorFrom(res, 'Edit failed'))
   return res.json()
 }
 
@@ -59,7 +76,7 @@ export async function approveImage(bundleCode, imagePath, title = '') {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ bundle_code: bundleCode, image_path: imagePath, title }),
   })
-  if (!res.ok) throw new Error(`Approve failed: ${res.statusText}`)
+  if (!res.ok) throw new Error(await errorFrom(res, 'Approve failed'))
   return res.json()
 }
 
@@ -72,7 +89,7 @@ export async function rejectImage(bundleCode, reason = '') {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ bundle_code: bundleCode, reason }),
   })
-  if (!res.ok) throw new Error(`Reject failed: ${res.statusText}`)
+  if (!res.ok) throw new Error(await errorFrom(res, 'Reject failed'))
   return res.json()
 }
 
@@ -82,7 +99,7 @@ export async function rejectImage(bundleCode, reason = '') {
  */
 export async function exportApproved() {
   const res = await fetch(`${API_BASE}/api/export`)
-  if (!res.ok) throw new Error(`Export failed: ${res.statusText}`)
+  if (!res.ok) throw new Error(await errorFrom(res, 'Export failed'))
   const blob = await res.blob()
   return URL.createObjectURL(blob)
 }
@@ -92,7 +109,7 @@ export async function exportApproved() {
  */
 export async function getApproved() {
   const res = await fetch(`${API_BASE}/api/approved`)
-  if (!res.ok) throw new Error(`Failed to get approved: ${res.statusText}`)
+  if (!res.ok) throw new Error(await errorFrom(res, 'Failed to get approved'))
   return res.json()
 }
 
@@ -107,7 +124,7 @@ export async function uploadImage(bundleCode, file) {
     method: 'POST',
     body: formData,
   })
-  if (!res.ok) throw new Error(`Upload failed: ${res.statusText}`)
+  if (!res.ok) throw new Error(await errorFrom(res, 'Upload failed'))
   return res.json()
 }
 
