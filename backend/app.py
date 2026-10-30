@@ -210,6 +210,18 @@ def get_gemini_client() -> GeminiClient:
     return GeminiClient(api_key=GEMINI_API_KEY)
 
 
+def get_gemini_optional() -> GeminiClient | None:
+    """A GeminiClient for background processing, or None if it isn't configured
+    (processing then skips the AI-separation step instead of failing)."""
+    if not GEMINI_API_KEY:
+        return None
+    try:
+        return GeminiClient(api_key=GEMINI_API_KEY)
+    except Exception as e:  # noqa: BLE001 — missing SDK must not break loading
+        logger.warning(f"Gemini unavailable for processing: {e}")
+        return None
+
+
 def get_processor() -> BundleProcessor:
     """Create a BundleProcessor instance."""
     return BundleProcessor()
@@ -318,7 +330,10 @@ USE_LOCAL_FILES = os.getenv("USE_LOCAL_FILES", "").strip().lower() in ("1", "tru
 TEST_BUNDLE_CODES = [
     c.strip() for c in os.getenv("TEST_BUNDLE_CODES", "").split(",") if c.strip()
 ]
-BUNDLE_CACHE_TTL = int(os.getenv("BUNDLE_CACHE_TTL", "3600"))  # processed-results cache (1h)
+# Processed-results cache lifetime in seconds. 0 (default) = keep the current
+# set until the reviewer asks for a "New batch", so the bundles they're working
+# on never silently change underneath them.
+BUNDLE_CACHE_TTL = int(os.getenv("BUNDLE_CACHE_TTL", "0"))
 
 
 def _bundles_payload() -> dict:
@@ -363,16 +378,75 @@ async def _confirmed_live(refresh: bool) -> list:
     )
 
 
-async def _load_bundles_job(refresh: bool, limit: int, force: bool) -> None:
+def _cached_bundle_set(cache_path: str) -> tuple[list, int]:
+    """The bundles currently on the dashboard (memory first, then the cache
+    file), plus the live total they came from."""
+    if bundle_data_cache:
+        return list(bundle_data_cache), _bundle_load.get("live_total") or len(bundle_data_cache)
+    try:
+        with open(cache_path) as f:
+            cached = json.load(f)
+        bundles = cached.get("bundles", [])
+        return bundles, cached.get("live_total", len(bundles))
+    except (OSError, json.JSONDecodeError):
+        return [], 0
+
+
+async def _reprocess_job(cache_path: str) -> bool:
+    """Re-run the latest rules on the bundles ALREADY on the dashboard — no new
+    search, no new bundles. Returns False if there is no cached set to reuse."""
+    global bundle_data_cache
+    current, live_total = _cached_bundle_set(cache_path)
+    if not current:
+        return False
+    batch = [{"code": b["code"], "title": b.get("title", ""), "products": []} for b in current]
+    _bundle_load.update(
+        phase="Re-checking the current bundles with the latest rules…",
+        total=len(batch), processed=0, found=0, scanned=0, live_total=live_total,
+    )
+
+    def _cb(done: int, _total: int) -> None:
+        _bundle_load.update(processed=done, scanned=done)
+
+    fresh = await get_processor().process_bundles(
+        bundles=batch, crawler=get_crawler(), composer=get_composer(),
+        uploads_dir=UPLOADS_DIR, progress_cb=_cb,
+        classifier=get_classifier(), gemini=get_gemini_optional(), max_concurrency=4,
+        force_fix=True,
+    )
+    # Keep the set stable: a bundle that still can't be improved keeps its
+    # previous card instead of vanishing from the dashboard.
+    by_code = {r["code"]: r for r in fresh}
+    results = [by_code.get(b["code"], b) for b in current]
+    bundle_data_cache = results
+    try:
+        with open(cache_path, "w") as f:  # noqa: ASYNC230 — small cache write
+            json.dump({"bundles": results, "live_total": live_total}, f)
+    except OSError as e:
+        logger.warning(f"Could not write bundle cache: {e}")
+    _bundle_load.update(
+        status="ready", phase="Done", processed=len(results), found=len(results),
+        finished_at=time.time(),
+    )
+    logger.info(f"Reprocessed {len(batch)} cached bundles -> {len(results)} need action")
+    return True
+
+
+async def _load_bundles_job(refresh: bool, limit: int, force: bool,
+                            reprocess: bool = False) -> None:
     """Background job: resolve bundles, crawl Boots.com, compose, cache results."""
     global bundle_data_cache
     cache_path = os.path.join(UPLOADS_DIR, "_bundle_cache.json")
     try:
+        # 0) Reprocess mode: improve the bundles already shown, find no new ones.
+        if reprocess and await _reprocess_job(cache_path):
+            return
+
         # 1) Serve the processed-results cache for instant repeat loads (unless
         #    a refresh or force bypass is requested).
         if not force and not refresh and os.path.exists(cache_path):
             age = time.time() - os.path.getmtime(cache_path)
-            if age < BUNDLE_CACHE_TTL:
+            if BUNDLE_CACHE_TTL <= 0 or age < BUNDLE_CACHE_TTL:
                 try:
                     with open(cache_path) as f:  # noqa: ASYNC230 — small cache read
                         cached = json.load(f)
@@ -416,13 +490,14 @@ async def _load_bundles_job(refresh: bool, limit: int, force: bool) -> None:
         # 3) Scan in chunks and STOP as soon as we've collected `target` defects,
         #    so the first batch is quick instead of processing a fixed count.
         classifier = get_classifier()
+        gemini = get_gemini_optional()
         results: list = []
         scanned = 0
         for start in range(0, len(scan_list), BUNDLE_SCAN_CHUNK):
             piece = scan_list[start:start + BUNDLE_SCAN_CHUNK]
             chunk_results = await processor.process_bundles(
                 bundles=piece, crawler=crawler, composer=composer,
-                uploads_dir=UPLOADS_DIR, classifier=classifier,
+                uploads_dir=UPLOADS_DIR, classifier=classifier, gemini=gemini,
             )
             results.extend(chunk_results)
             scanned += len(piece)
@@ -453,6 +528,9 @@ async def _load_bundles_job(refresh: bool, limit: int, force: bool) -> None:
 async def get_bundles(
     refresh: bool = Query(False, description="Re-fetch the full list from Monday.com"),
     force: bool = Query(False, description="Bypass the processed-results cache and reprocess"),
+    reprocess: bool = Query(
+        False, description="Re-run the latest rules on the bundles already shown (no new search)",
+    ),
     limit: int = Query(
         DEFAULT_BUNDLE_LIMIT, ge=1, le=500,
         description="How many defective bundles to collect before stopping",
@@ -466,12 +544,14 @@ async def get_bundles(
     is fresh (<1h) — so repeat loads are near-instant.
     Poll until `status` is `"ready"`, then `bundles` is populated.
       - `refresh=true`: re-fetch the real confirmed-live list from Monday.com.
-      - `force=true`: bypass the processed-results cache and reprocess.
+      - `force=true`: bypass the processed-results cache and scan a new batch.
+      - `reprocess=true`: re-run the latest rules on the bundles already shown.
     """
     global _bundle_task
 
-    # Serve in-memory cached results immediately (unless refresh/force requested).
-    if _bundle_load["status"] == "ready" and bundle_data_cache and not refresh and not force:
+    # Serve in-memory cached results immediately (unless a reload is requested).
+    if (_bundle_load["status"] == "ready" and bundle_data_cache
+            and not refresh and not force and not reprocess):
         return _bundles_payload()
 
     # A load already running: just report progress (don't start another).
@@ -484,7 +564,7 @@ async def get_bundles(
         error=None, started_at=time.time(), finished_at=None,
     )
     _bundle_task = asyncio.create_task(
-        _load_bundles_job(refresh=refresh, limit=limit, force=force),
+        _load_bundles_job(refresh=refresh, limit=limit, force=force, reprocess=reprocess),
     )
     return _bundles_payload()
 

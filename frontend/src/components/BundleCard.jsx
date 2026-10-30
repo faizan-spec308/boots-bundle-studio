@@ -2,6 +2,15 @@ import React, { useState } from 'react'
 import EditPanel from './EditPanel.jsx'
 import { approveImage, rejectImage, generateImage } from '../api/client.js'
 
+// How the generated image was produced — so reviewers know what to check.
+const METHOD_CHIP = {
+  cut: { tone: 'is-exact', label: 'Exact products from the original' },
+  ai_separated: { tone: 'is-ai', label: 'AI-assisted — check the small print' },
+  duplicate: { tone: 'is-photo', label: 'Built from the Boots.com product photo' },
+  component: { tone: 'is-photo', label: 'Built from the Boots.com product photo' },
+  components: { tone: 'is-photo', label: 'Built from Boots.com product photos' },
+}
+
 export default function BundleCard({ bundle, activeTab, onUpdate }) {
   const [showEdit, setShowEdit] = useState(false)
   const [actionLoading, setActionLoading] = useState(false)
@@ -84,6 +93,12 @@ export default function BundleCard({ bundle, activeTab, onUpdate }) {
             ))}
           </ul>
         </div>
+      )}
+
+      {bundle.method && METHOD_CHIP[bundle.method] && (
+        <span className={`method-chip ${METHOD_CHIP[bundle.method].tone}`}>
+          {METHOD_CHIP[bundle.method].label}
+        </span>
       )}
 
       <div className="image-comparison">

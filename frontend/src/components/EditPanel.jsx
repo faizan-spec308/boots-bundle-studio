@@ -1,5 +1,16 @@
-import React, { useState } from 'react'
+import React, { useEffect, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { editImage, approveImage } from '../api/client.js'
+
+const SUGGESTIONS = [
+  {
+    label: 'Remove number badge',
+    prompt: 'Remove the multiplier number badge/tag (e.g. the "3" or "x3" label) from the image. Keep every product, its packaging, colours, text and logos exactly the same — change nothing else.',
+  },
+  { label: 'Add more space', prompt: 'Add more space between the products' },
+  { label: 'Make bigger', prompt: 'Make the products slightly bigger' },
+  { label: 'Center products', prompt: 'Center the products in the image' },
+]
 
 export default function EditPanel({ bundle, onClose, onUpdate }) {
   const [prompt, setPrompt] = useState('')
@@ -13,6 +24,7 @@ export default function EditPanel({ bundle, onClose, onUpdate }) {
   const [approved, setApproved] = useState(false)
 
   const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+  const busy = loading || approving
 
   const currentImage = editedImagePath || bundle.generated_image || bundle.original_image
   // Cache-bust with the edit count so successive edits (same filename) visibly update.
@@ -22,6 +34,20 @@ export default function EditPanel({ bundle, onClose, onUpdate }) {
   const originalSrc = bundle.original_image
     ? `${API_BASE}/api/images/${bundle.original_image.split('/').pop()}`
     : null
+
+  // A real pop-up: lock the page behind it and close on Escape.
+  useEffect(() => {
+    const prevOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    function onKey(e) {
+      if (e.key === 'Escape' && !busy) onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => {
+      document.body.style.overflow = prevOverflow
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [busy, onClose])
 
   async function handleEdit(retryPrompt) {
     const thisPrompt = (typeof retryPrompt === 'string' ? retryPrompt : prompt).trim()
@@ -67,115 +93,103 @@ export default function EditPanel({ bundle, onClose, onUpdate }) {
   }
 
   function handleKeyDown(e) {
-    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
-      handleEdit()
-    }
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) handleEdit()
   }
 
   const lastPrompt = editHistory.length ? editHistory[editHistory.length - 1].prompt : ''
 
-  return (
-    <div className="edit-panel-overlay" onClick={onClose}>
-      <div className="edit-panel" onClick={e => e.stopPropagation()}>
-        <div className="edit-panel-header">
-          <h2>Edit Image — {bundle.code}</h2>
-          <button className="close-btn" onClick={onClose}>✕</button>
-        </div>
+  return createPortal(
+    <div
+      className="edit-modal-backdrop"
+      onMouseDown={e => { if (e.target === e.currentTarget && !busy) onClose() }}
+    >
+      <div className="edit-modal" role="dialog" aria-modal="true" aria-labelledby="edit-modal-title">
+        <header className="edit-modal-header">
+          <div className="edit-modal-heading">
+            <span className="eyebrow">Edit image · {bundle.code}</span>
+            <h2 id="edit-modal-title">{bundle.title || 'Untitled bundle'}</h2>
+          </div>
+          <button className="close-btn" onClick={onClose} disabled={busy} aria-label="Close editor">✕</button>
+        </header>
 
-        <div className="edit-panel-body">
-          <div className="edit-comparison">
-            <div className="edit-image-side">
-              <h4>Original</h4>
-              {originalSrc ? (
-                <img src={originalSrc} alt="Original" />
-              ) : (
-                <div className="no-image">No original</div>
-              )}
-            </div>
-            <div className="edit-image-side">
-              <h4>Current</h4>
-              {currentImageSrc ? (
-                <img src={currentImageSrc} alt="Current" />
-              ) : (
-                <div className="no-image">No image</div>
-              )}
-              {loading && (
-                <div className="edit-loading-overlay">
-                  <div className="spinner"></div>
-                  <p>Applying edit via Gemini AI…</p>
-                </div>
-              )}
-            </div>
+        <div className="edit-modal-body">
+          <div className="edit-compare">
+            <figure className="edit-figure">
+              <figcaption>Original</figcaption>
+              <div className="edit-frame">
+                {originalSrc
+                  ? <img src={originalSrc} alt="Original bundle" />
+                  : <div className="no-image">No original</div>}
+              </div>
+            </figure>
+            <figure className="edit-figure is-current">
+              <figcaption>
+                {editHistory.length ? `Edited · version ${editHistory.length}` : 'Current'}
+              </figcaption>
+              <div className="edit-frame">
+                {currentImageSrc
+                  ? <img src={currentImageSrc} alt="Current bundle" />
+                  : <div className="no-image">No image</div>}
+                {loading && (
+                  <div className="edit-loading-overlay">
+                    <div className="spinner"></div>
+                    <p>Applying your edit…</p>
+                  </div>
+                )}
+              </div>
+            </figure>
           </div>
 
           {justApplied && !loading && (
-            <div className="edit-applied">
-              ✓ Edit applied — “{lastPrompt}”. Review it above, keep refining, or approve.
+            <div className="edit-status is-success">
+              ✓ Edit applied — “{lastPrompt}”. Compare it with the original, keep refining, or approve.
             </div>
           )}
-          {approved && (
-            <div className="edit-applied">✓ Approved — added to the export.</div>
-          )}
-
+          {approved && <div className="edit-status is-success">✓ Approved — added to the export.</div>}
           {warnings.length > 0 && (
-            <div className="edit-warnings">
-              <strong>⚠ Fidelity warnings:</strong>
-              <ul>
-                {warnings.map((w, i) => <li key={i}>{w}</li>)}
-              </ul>
+            <div className="edit-status is-warning">
+              <strong>Check the result:</strong>
+              <ul>{warnings.map((w, i) => <li key={i}>{w}</li>)}</ul>
             </div>
           )}
-
-          <div className="edit-prompt-area">
-            <label htmlFor="edit-prompt">Enter edit instructions:</label>
-            <textarea
-              id="edit-prompt"
-              value={prompt}
-              onChange={e => setPrompt(e.target.value)}
-              onKeyDown={handleKeyDown}
-              placeholder="e.g. Add more space between the products and make them slightly smaller"
-              rows={3}
-              disabled={loading}
-            />
-            <div className="prompt-hint">
-              Edits use Gemini AI and build on each other. Tip: Ctrl/Cmd+Enter to apply.
-            </div>
-          </div>
-
           {error && (
-            <div className="action-error">
-              <strong>Edit failed:</strong> {error}
+            <div className="edit-status is-error">
+              <span><strong>Edit failed:</strong> {error}</span>
               <button onClick={() => handleEdit(lastPrompt || undefined)} disabled={loading}>Retry</button>
             </div>
           )}
 
-          <div className="edit-panel-actions">
-            <button
-              className="btn-apply-edit"
-              onClick={() => handleEdit()}
-              disabled={loading || !prompt.trim()}
-            >
-              {loading ? (
-                <><span className="spinner-sm"></span> Applying…</>
-              ) : 'Apply Edit'}
-            </button>
-            {editedImagePath && (
+          <div className="edit-prompt">
+            <label htmlFor="edit-prompt-input">Describe the change</label>
+            <div className="edit-prompt-row">
+              <textarea
+                id="edit-prompt-input"
+                value={prompt}
+                onChange={e => setPrompt(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder="e.g. Add more space between the products"
+                rows={2}
+                disabled={loading}
+              />
               <button
-                className="btn-approve"
-                onClick={handleApprove}
-                disabled={loading || approving || approved}
+                className="btn-apply-edit"
+                onClick={() => handleEdit()}
+                disabled={loading || !prompt.trim()}
               >
-                {approved ? '✓ Approved' : approving ? 'Approving…' : 'Approve this image'}
+                {loading ? <><span className="spinner-sm"></span> Applying</> : 'Apply edit'}
               </button>
-            )}
-            <button className="btn-done" onClick={onClose} disabled={loading || approving}>
-              {editedImagePath ? 'Keep & close' : 'Close'}
-            </button>
+            </div>
+            <div className="suggestion-chips">
+              {SUGGESTIONS.map(s => (
+                <button key={s.label} onClick={() => setPrompt(s.prompt)} disabled={loading}>{s.label}</button>
+              ))}
+            </div>
+            <p className="prompt-hint">Edits build on each other · Ctrl/⌘ + Enter to apply · Esc to close</p>
           </div>
 
           {editHistory.length > 0 && (
             <div className="edit-history">
-              <p><strong>Edits applied ({editHistory.length}):</strong></p>
+              <p>Edits applied ({editHistory.length})</p>
               <ol>
                 {editHistory.map((h, i) => (
                   <li key={i}><span className="edit-history-time">{h.time}</span> {h.prompt}</li>
@@ -183,18 +197,22 @@ export default function EditPanel({ bundle, onClose, onUpdate }) {
               </ol>
             </div>
           )}
-
-          <div className="edit-suggestions">
-            <p><strong>Quick suggestions:</strong></p>
-            <div className="suggestion-chips">
-              <button onClick={() => setPrompt('Remove the multiplier number badge/tag (e.g. the "3" or "x3" label) from the image. Keep every product, its packaging, colours, text and logos exactly the same — change nothing else.')}>Remove number badge</button>
-              <button onClick={() => setPrompt('Add more space between the products')}>Add more space</button>
-              <button onClick={() => setPrompt('Make the products slightly bigger')}>Make bigger</button>
-              <button onClick={() => setPrompt('Center the products in the image')}>Center products</button>
-            </div>
-          </div>
         </div>
+
+        <footer className="edit-modal-footer">
+          <button className="btn-done" onClick={onClose} disabled={busy}>
+            {editedImagePath ? 'Keep & close' : 'Close'}
+          </button>
+          <button
+            className="btn-approve"
+            onClick={handleApprove}
+            disabled={busy || approved}
+          >
+            {approved ? '✓ Approved' : approving ? 'Approving…' : 'Approve this image'}
+          </button>
+        </footer>
       </div>
-    </div>
+    </div>,
+    document.body,
   )
 }

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import os
 
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
 
 class ImageComposer:
@@ -143,11 +143,22 @@ class ImageComposer:
             )
             current_x += img.width + gap
 
-        # Blur the shadow layer, then paste products on top
+        # Blur the shadow layer, then lay the products over it.
         shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=self.SHADOW_BLUR))
-        canvas = Image.alpha_composite(canvas, shadow_layer)
+        canvas = Image.alpha_composite(canvas, shadow_layer).convert("RGB")
         for img, px, py in placements:
-            canvas.paste(img, (px, py), img)  # alpha channel as mask
+            # Multiply-blend instead of pasting: a product photo's white background
+            # then lets the shadow show through (no white "box" edge around the
+            # product), while every product pixel — white packaging included —
+            # stays intact. Near-white background noise is snapped to pure white
+            # first so it can't tint the canvas.
+            flat = Image.new("RGB", img.size, self.BACKGROUND_COLOR)
+            flat.paste(img, (0, 0), img if img.mode == "RGBA" else None)
+            # (Only the last few levels — white packaging often has faint grey
+            # edges around 240-250 that must survive.)
+            flat = flat.point(lambda v: 255 if v >= 253 else v)
+            box = (px, py, px + flat.width, py + flat.height)
+            canvas.paste(ImageChops.multiply(canvas.crop(box), flat), box)
 
         # Apply roundel if needed (6+ identical items)
         if use_roundel and self.roundel_path and os.path.exists(self.roundel_path):
@@ -245,6 +256,192 @@ class ImageComposer:
             return None, min_score, None
         tallest = max(heights) or 1
         return [round(h / tallest, 3) for h in heights], min_score, xs
+
+    def segment_original(self, original_path: str, n: int) -> list[Image.Image] | None:
+        """Cut the ORIGINAL bundle image into `n` product crops (left-to-right).
+        This keeps the EXACT products (right variant, colours, sizes, order) from
+        the original instead of relying on component photos, which often don't
+        match.
+
+        Tries 2D separation first (each product as its own connected shape —
+        works even when products sit side by side at different heights), then
+        falls back to vertical cuts at clean column gaps. Returns trimmed RGBA
+        crops, or None if the products can't be separated cleanly (they touch or
+        overlap, or the image doesn't actually show `n` products).
+        """
+        try:
+            import numpy as np  # noqa: F401 — availability check
+        except ImportError:
+            return None
+        if n < 2 or not original_path or not os.path.exists(original_path):
+            return None
+        try:
+            base = self._trim_whitespace(Image.open(original_path).convert("RGBA"))
+        except OSError:
+            return None
+        rgb = base.convert("RGB")
+        w, h = rgb.size
+        if w < 40 or h < 40:
+            return None
+        crops = self._segment_by_shapes(rgb, n)
+        if crops:
+            return crops
+        return self._segment_by_columns(rgb, n)
+
+    def _segment_by_shapes(self, rgb: Image.Image, n: int) -> list[Image.Image] | None:
+        """Find the products as separate connected shapes on the background."""
+        import numpy as np
+
+        w, h = rgb.size
+        scale = min(1.0, 400 / max(w, h))
+        sw, sh = max(1, int(w * scale)), max(1, int(h * scale))
+        small = np.asarray(rgb.resize((sw, sh), Image.BILINEAR)).astype(int)
+        border = np.concatenate([small[0], small[-1], small[:, 0], small[:, -1]])
+        bg = np.median(border, axis=0)
+        fg = np.abs(small - bg).max(axis=2) > 14
+        # Close tiny breaks inside a product (thin lids, glare) with a dilation.
+        for _ in range(2):
+            grown = fg.copy()
+            grown[1:] |= fg[:-1]
+            grown[:-1] |= fg[1:]
+            grown[:, 1:] |= fg[:, :-1]
+            grown[:, :-1] |= fg[:, 1:]
+            fg = grown
+
+        labels = np.zeros((sh, sw), dtype=np.int32)
+        comps: list[tuple[int, int, int, int, int, int]] = []  # id, size, x0, y0, x1, y1
+        next_id = 0
+        for sy in range(sh):
+            for sx in range(sw):
+                if not fg[sy, sx] or labels[sy, sx]:
+                    continue
+                next_id += 1
+                stack = [(sy, sx)]
+                labels[sy, sx] = next_id
+                size, x0, y0, x1, y1 = 0, sx, sy, sx, sy
+                while stack:
+                    cy, cx = stack.pop()
+                    size += 1
+                    x0, x1 = min(x0, cx), max(x1, cx)
+                    y0, y1 = min(y0, cy), max(y1, cy)
+                    for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                        if 0 <= ny < sh and 0 <= nx < sw and fg[ny, nx] and not labels[ny, nx]:
+                            labels[ny, nx] = next_id
+                            stack.append((ny, nx))
+                comps.append((next_id, size, x0, y0, x1, y1))
+
+        total = sum(c[1] for c in comps) or 1
+        big = [c for c in comps if c[1] >= 0.04 * total]
+        if len(big) != n:
+            return None
+
+        # Small islands (e.g. a logo printed on a WHITE box, whose face looks like
+        # background) belong to the nearest main product — attach them rather
+        # than treating them as another product and painting them out.
+        def gap_to(b, cx, cy):
+            dx = max(b[2] - cx, 0, cx - b[4])
+            dy = max(b[3] - cy, 0, cy - b[5])
+            return dx * dx + dy * dy
+
+        lut = np.zeros(next_id + 1, dtype=np.int32)
+        for c in comps:
+            if c in big:
+                lut[c[0]] = c[0]
+            else:
+                cx, cy = (c[2] + c[4]) / 2, (c[3] + c[5]) / 2
+                lut[c[0]] = min(big, key=lambda b, cx=cx, cy=cy: gap_to(b, cx, cy))[0]
+        groups = lut[labels]
+
+        boxes = []
+        for b in big:
+            ys, xs = np.nonzero(groups == b[0])
+            boxes.append((int(xs.min()), b[0], int(ys.min()), int(xs.max()), int(ys.max())))
+        boxes.sort()  # left-to-right
+
+        crops: list[Image.Image] = []
+        inv = 1 / scale
+        pad = int(0.02 * max(w, h))  # room for faint packaging edges; trim tidies it
+        for x0, gid, y0, x1, y1 in boxes:
+            # Hide every OTHER product inside this product's box, then crop.
+            others = (groups > 0) & (groups != gid)
+            hide = Image.fromarray((others * 255).astype(np.uint8)).resize((w, h), Image.NEAREST)
+            clean = rgb.copy()
+            clean.paste((255, 255, 255), mask=hide)
+            box = (max(0, int(x0 * inv) - pad), max(0, int(y0 * inv) - pad),
+                   min(w, int((x1 + 1) * inv) + pad), min(h, int((y1 + 1) * inv) + pad))
+            seg = self._trim_whitespace(clean.crop(box).convert("RGBA"))
+            if seg.width < 20 or seg.height < 20:
+                return None
+            crops.append(seg)
+        return crops
+
+    def _segment_by_columns(self, rgb: Image.Image, n: int) -> list[Image.Image] | None:
+        """Fallback: cut at clean vertical gaps between side-by-side products."""
+        import numpy as np
+
+        w, h = rgb.size
+
+        gray = np.asarray(rgb.convert("L"))
+        # Count non-white pixels per column -> where the products actually are.
+        content = (gray < 244).sum(axis=0).astype(float)
+        if content.max() <= 0:
+            return None
+        k = max(3, w // 80)
+        prof = np.convolve(content, np.ones(k) / k, mode="same")
+
+        # Find a clean gap near each expected boundary (equal-width zones).
+        splits: list[int] = []
+        for i in range(1, n):
+            center = w * i / n
+            half = int(w / (2 * n))
+            lo, hi = max(1, int(center - half)), min(w - 1, int(center + half))
+            if hi <= lo:
+                return None
+            x = lo + int(np.argmin(prof[lo:hi]))
+            left = prof[max(0, x - half):x]
+            right = prof[x:min(w, x + half)]
+            shoulder = min(
+                left.max() if left.size else 0.0,
+                right.max() if right.size else 0.0,
+            )
+            # A real gap drops well below the product content on both sides.
+            if shoulder <= 0 or prof[x] > 0.45 * shoulder:
+                return None
+            splits.append(x)
+
+        bounds = [0, *splits, w]
+        crops: list[Image.Image] = []
+        for a, b in zip(bounds[:-1], bounds[1:]):  # noqa: RUF007 — pairwise needs py3.10
+            if b - a < 15:
+                return None
+            seg = self._trim_whitespace(rgb.crop((a, 0, b, h)).convert("RGBA"))
+            if seg.width < 20 or seg.height < 20:
+                return None
+            crops.append(seg)
+        return crops
+
+    def rebuild_by_splitting(self, original_path: str, n: int, output_path: str) -> bool:
+        """Separate the products out of the original and re-space them cleanly,
+        preserving their real sizes. Returns True on success, False if the
+        original can't be split cleanly (caller should fall back)."""
+        crops = self.segment_original(original_path, n)
+        if not crops:
+            return False
+        heights = [c.height for c in crops]
+        tallest = max(heights) or 1
+        rel = [h / tallest for h in heights]
+        segdir = os.path.join(os.path.dirname(output_path) or ".", "_segcrops")
+        os.makedirs(segdir, exist_ok=True)
+        base = os.path.splitext(os.path.basename(output_path))[0]
+        paths = []
+        for i, crop in enumerate(crops):
+            p = os.path.join(segdir, f"{base}_{i}.png")
+            crop.save(p)
+            paths.append(p)
+        self.compose_bundle_image(
+            paths, output_path, quantities=[1] * len(paths), relative_heights=rel,
+        )
+        return True
 
     def _resize_product(self, img: Image.Image, target_height: int) -> Image.Image:
         """Scale a product to the target height, keeping aspect ratio. Always

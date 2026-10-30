@@ -55,7 +55,7 @@ export default function App() {
 
   // Kick off the initial load; clean up any pending poll on unmount.
   useEffect(() => {
-    loadBundles(false)
+    loadBundles('')
     return () => { if (pollRef.current) clearTimeout(pollRef.current) }
   }, [])
 
@@ -72,9 +72,9 @@ export default function App() {
 
   // The backend loads bundles in the background and reports progress. We poll
   // until it reports "ready" (or "error").
-  async function poll(refresh) {
+  async function poll(mode) {
     try {
-      const data = await fetchBundles(refresh)
+      const data = await fetchBundles(mode)
       failCountRef.current = 0
       setWaking(false)
       if (data.status === 'ready') {
@@ -93,7 +93,7 @@ export default function App() {
         // still loading — show progress and poll again shortly
         setProgress(data)
         setLoading(true)
-        pollRef.current = setTimeout(() => poll(false), 2000)
+        pollRef.current = setTimeout(() => poll(''), 2000)
       }
     } catch (err) {
       // Network error — most often the backend is still cold-starting. Keep
@@ -105,12 +105,12 @@ export default function App() {
         setWaking(true)
         setLoading(true)
         const backoff = Math.min(2000 + failCountRef.current * 1000, 6000)
-        pollRef.current = setTimeout(() => poll(refresh), backoff)
+        pollRef.current = setTimeout(() => poll(mode), backoff)
       } else {
         setWaking(false)
         setError(
           "Can't reach the backend. It may be starting up (the free server sleeps " +
-          "when idle) — wait a moment and hit Refresh.",
+          "when idle) — wait a moment and hit Retry.",
         )
         setLoading(false)
         clearPoll()
@@ -118,14 +118,18 @@ export default function App() {
     }
   }
 
-  function loadBundles(refresh = false) {
+  // mode: '' (initial / current), 'reprocess' (re-check the bundles shown),
+  // 'force' (scan a new batch). Reloads clear the grid so the progress screen
+  // shows exactly what's happening.
+  function loadBundles(mode = '') {
     setError(null)
     setLoading(true)
     setWaking(false)
+    if (mode) setBundles([])
     failCountRef.current = 0
     loadStartRef.current = Date.now()
     clearPoll()
-    poll(refresh)
+    poll(mode)
   }
 
   // Categorize bundles into the three dashboard sections
@@ -171,14 +175,23 @@ export default function App() {
           </div>
         </div>
         <div className="header-right">
-          <ExportButton bundles={bundles} />
           <button
             className="refresh-btn"
-            onClick={() => loadBundles(true)}
+            onClick={() => loadBundles('reprocess')}
             disabled={loading}
+            title="Re-run the latest fixes on the bundles shown — no new bundles"
           >
-            {loading ? 'Loading…' : '↻ Refresh'}
+            {loading ? 'Working…' : '↻ Re-check these'}
           </button>
+          <button
+            className="refresh-btn"
+            onClick={() => loadBundles('force')}
+            disabled={loading}
+            title="Scan for a new batch of bundles that need fixing"
+          >
+            New batch
+          </button>
+          <ExportButton bundles={bundles} />
         </div>
       </header>
 
@@ -199,7 +212,7 @@ export default function App() {
         {error && (
           <div className="error-banner">
             <strong>Error:</strong> {error}
-            <button onClick={() => loadBundles(true)}>Retry</button>
+            <button onClick={() => loadBundles('')}>Retry</button>
           </div>
         )}
 
@@ -222,9 +235,13 @@ export default function App() {
                   <div className="progress-fill" style={{ width: `${pct}%` }}></div>
                 </div>
                 <p className="progress-text">
-                  {progress.found ?? progress.processed} of ~{progress.total} bundles to review found
-                  {progress.scanned ? ` · ${progress.scanned} checked` : ''}
-                  {progress.live_total ? ` · ${progress.live_total.toLocaleString()} live` : ''}
+                  {progress.phase?.startsWith('Re-checking')
+                    ? `${progress.processed} of ${progress.total} bundles re-checked`
+                    : <>
+                        {progress.found ?? progress.processed} of ~{progress.total} bundles to review found
+                        {progress.scanned ? ` · ${progress.scanned} checked` : ''}
+                        {progress.live_total ? ` · ${progress.live_total.toLocaleString()} live` : ''}
+                      </>}
                 </p>
               </div>
             )}

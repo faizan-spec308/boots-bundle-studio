@@ -21,6 +21,7 @@ import asyncio
 import logging
 import os
 import re
+import typing
 
 from PIL import Image
 
@@ -45,6 +46,14 @@ class BundleProcessor:
     # The most items (multipack units or distinct products) we'll line up in one
     # clean image. Anything larger goes to Manual Review instead.
     MAX_ITEMS_IN_ROW = 5
+    # How closely a component photo must match the product in the original
+    # before we trust it enough to duplicate it for a multipack.
+    COMPONENT_MATCH_MIN = 0.5
+    # Multi-product bundles only fall back to component photos (after the
+    # original-image path failed) when they match the original strongly. In
+    # the 0.60–0.70 band component photos were often a different variant or
+    # carried baked-in tags (e.g. Dove's "75 ml"), so those go to Manual.
+    COMPONENT_REBUILD_STRONG = 0.70
 
     def __init__(self):
         pass
@@ -256,6 +265,8 @@ class BundleProcessor:
         progress_cb=None,
         max_concurrency: int = 8,
         classifier=None,
+        gemini=None,
+        force_fix=False,
     ) -> list[dict]:
         """
         Full pipeline: assess quality, crawl for product images, categorize, and
@@ -294,7 +305,7 @@ class BundleProcessor:
         async def worker(index: int, bundle: dict) -> None:
             async with sem:
                 result = await self._process_one(
-                    bundle, crawler, composer, uploads_dir, classifier,
+                    bundle, crawler, composer, uploads_dir, classifier, gemini, force_fix,
                 )
             results[index] = result
             async with lock:
@@ -389,29 +400,137 @@ class BundleProcessor:
             return self._result(code, title, 'manual', original_image_path, None, products,
                                  0.4, issues, arrangement['reasoning'], True)
 
+    _CHECK_LABELS: typing.ClassVar[dict[str, str]] = {
+        'same_products': 'different product or variant',
+        'same_count': 'wrong number of items',
+        'no_added_marks': 'extra tag or badge',
+        'text_intact': 'garbled label text',
+        'no_overlap': 'products still overlap',
+    }
+
+    async def _check_rebuild(self, code, original_image_path, result, classifier, method):
+        """Verify a rebuilt image against the original with the vision model.
+        If it fails (wrong variant, wrong count, added tags, garbled text,
+        overlap), demote to Manual Review — keeping the attempt visible so the
+        reviewer can see what went wrong."""
+        if not result or result.get('category') != 'ready':
+            return result
+        result['method'] = method
+        generated = result.get('generated_image')
+        if not classifier or not generated or not original_image_path:
+            return result
+        v = await asyncio.to_thread(classifier.verify, original_image_path, generated)
+        if v is None:
+            result['quality_issues'] = [
+                *result.get('quality_issues', []),
+                "The automatic check against the original couldn't run — review "
+                + "carefully before approving.",
+            ]
+            return result
+        if v['ok']:
+            return result
+        # Reject on the first failure: a bad image wrongly marked Ready costs far
+        # more than a good one sent to Manual (where the attempt stays visible).
+        failed = [self._CHECK_LABELS[k] for k in self._CHECK_LABELS if not v.get(k)]
+        logger.info(f"Bundle {code}: rebuild failed verification ({', '.join(failed)})")
+        result.update(
+            category='manual', quality_score=0.4,
+            quality_issues=[
+                "The rebuilt image didn't pass the check against the original "
+                + f"({', '.join(failed)}): {v['reason']} Needs manual review.",
+            ],
+        )
+        return result
+
+    async def _rebuild_from_original(self, code, original_image_path, n, composer,
+                                     gemini, uploads_dir, remove_badge=False):
+        """Rebuild using the ORIGINAL image's own products (the right variant,
+        colours and sizes) instead of component photos, which often don't match.
+
+        1. If the products already have clean gaps between them, cut them apart
+           and re-lay them with proper spacing (no AI, perfect fidelity).
+        2. Otherwise (they touch/overlap), ask Gemini to separate the products
+           in the original, then cut THAT result and re-lay it in the standard
+           layout. If the AI result still can't be cut into `n` clean products,
+           the AI failed and we return None.
+
+        Returns (generated_path, used_ai) or (None, False).
+        """
+        if not composer or not original_image_path or n < 2:
+            return None, False
+        out = os.path.join(uploads_dir, f"{code}_generated.jpg")
+
+        if not remove_badge:
+            ok = await asyncio.to_thread(composer.rebuild_by_splitting,
+                                         original_image_path, n, out)
+            if ok:
+                return out, False
+
+        if gemini is None:
+            return None, False
+        separated = os.path.join(uploads_dir, f"{code}_separated.jpg")
+        badge_clause = (
+            " Also remove any overlaid promotional multiplier badge (e.g. a circle "
+            "with 'x2' or 'x3'); it is not part of any product." if remove_badge else ""
+        )
+        base_prompt = (
+            f"Move the {n} products apart horizontally so they stand side by side in a "
+            "single row with a clear white gap between each one — no product may touch "
+            "or overlap another. Show every product in full, keep each one's size, "
+            "shape, colours and label text exactly as they are, and keep the plain "
+            f"white background.{badge_clause}"
+        )
+        prompts = [
+            base_prompt,
+            # Firmer second attempt if the first still left products touching.
+            base_prompt + (
+                " IMPORTANT: leave a WIDE empty white gap between neighbouring products — "
+                "at least a tenth of the image width — and keep all products standing on "
+                "the same baseline."
+            ),
+        ]
+        for attempt, prompt in enumerate(prompts, 1):
+            try:
+                await asyncio.to_thread(gemini.edit_image, original_image_path, prompt, separated)
+            except Exception as e:  # noqa: BLE001 — AI failure falls back, never aborts
+                logger.warning(f"Bundle {code}: Gemini separation failed: {e}")
+                return None, False
+            ok = await asyncio.to_thread(composer.rebuild_by_splitting, separated, n, out)
+            if ok:
+                return out, True
+            logger.info(f"Bundle {code}: AI separation attempt {attempt} didn't yield "
+                        f"{n} clean products")
+        return None, False
+
     async def _rebuild_from_components(self, code, title, original_image_path, products,
-                                       components, arrangement, composer, uploads_dir, verdict):
+                                       components, arrangement, composer, uploads_dir, verdict,
+                                       gemini=None, classifier=None):
         """Decide how to rebuild a bundle that the vision model flagged.
 
-        - No clean components available -> Supplier Image Required.
-        - Single product type: a multipack of identical units. Rebuild showing
-          the product `quantity` times when the count is reliable; if a badge
-          implies several but the count is unknown (e.g. "4x" but WCS says 1) ->
-          Manual Review.
-        - Multiple distinct products: measure each product's real size from the
-          original and rebuild preserving those sizes. If sizes can't be measured
-          confidently (occlusion / heavy overlap / missing product) -> Manual,
-          unless the only flaw was slight overlap, in which case the original is
-          fine as-is and the bundle is filtered out.
+        Preferred: rebuild from the ORIGINAL image's own products (cut apart, or
+        AI-separated then cut) — this keeps the exact product variant, colours,
+        sizes and order. Component photos are only a fallback, because they
+        often show a different variant, a colour swatch or even a placeholder.
 
-        General rule: we never try to line up more than MAX_ITEMS_IN_ROW items in
-        a single image — larger packs go to Manual Review instead.
+        - No clean components available -> Supplier Image Required.
+        - More than MAX_ITEMS_IN_ROW items -> Manual Review.
+        - Original shows only ONE unit with a multiplier badge -> duplicate the
+          clean component photo ×quantity, but only if that photo is verified to
+          match the product in the original; otherwise Manual Review.
+        - Unknown multipack count (badge/title says several, WCS says 1) -> Manual.
+        - Fallback for multi-product bundles: rebuild from component photos at
+          sizes measured in the original; if they can't be matched confidently,
+          keep the original (overlap only) or Manual.
         """
         reason = (verdict or {}).get('reason') or ''
 
         def manual(msg):
             return self._result(code, title, 'manual', original_image_path, None, products,
                                  0.4, [msg], arrangement['reasoning'], True)
+
+        def ready(path, msg):
+            return self._result(code, title, 'ready', original_image_path, path, products,
+                                 0.6, [msg], arrangement['reasoning'], True)
 
         if not components:
             issues = [
@@ -424,31 +543,76 @@ class BundleProcessor:
 
         distinct = len({c['code'] for c in components})
         total_units = sum(c['quantity'] for c in components)
+        has_badge = bool(verdict and verdict.get('has_badge'))
+        single_unit_shown = bool(verdict and verdict.get('single_with_badge'))
+        badge_implies_more = has_badge or single_unit_shown
 
-        badge_implies_more = bool(
-            verdict and (verdict.get('single_with_badge') or verdict.get('has_badge')))
+        # --- Too many items for one clean image ---
+        if distinct == 1 and total_units > self.MAX_ITEMS_IN_ROW:
+            logger.info(f"Bundle {code}: manual (pack of {total_units} too large)")
+            return manual(
+                f"Multipack of {total_units} — too many units to show clearly in a single "
+                "image. Needs manual review (e.g. a representative shot or a roundel).")
+        if distinct > self.MAX_ITEMS_IN_ROW:
+            logger.info(f"Bundle {code}: manual ({distinct} products too many for one row)")
+            return manual(
+                f"{distinct} different products — too many to arrange clearly in a single "
+                "image. Needs manual review.")
+
+        # --- Preferred: rebuild from the original's own products ---
+        # (Skipped when the original shows just one unit — there's nothing to
+        # separate; that case duplicates a verified component photo below.)
+        if not single_unit_shown and 2 <= total_units <= self.MAX_ITEMS_IN_ROW:
+            path, used_ai = await self._rebuild_from_original(
+                code, original_image_path, total_units, composer, gemini, uploads_dir,
+                remove_badge=has_badge,
+            )
+            if path:
+                if used_ai:
+                    msg = ("Products overlapped, so AI separated them in the original image, "
+                           "then they were re-laid with clear spacing — check the details "
+                           "match before approving.")
+                else:
+                    msg = ("Separated the products from the original image and added clear "
+                           "spacing — the exact products and sizes are preserved.")
+                logger.info(f"Bundle {code}: rebuilt from original (ai={used_ai})")
+                # A clean cut reuses the original's own pixels, so only AI output
+                # needs checking (it can garble small text).
+                return await self._check_rebuild(
+                    code, original_image_path, ready(path, msg),
+                    classifier if used_ai else None,
+                    'ai_separated' if used_ai else 'cut',
+                )
 
         # --- Single product type (multipack of identical units) ---
         if distinct == 1:
-            if total_units > self.MAX_ITEMS_IN_ROW:
-                # Too many units to line up in one clean image -> manual review.
-                logger.info(f"Bundle {code}: manual (pack of {total_units} too large)")
-                return manual(
-                    f"Multipack of {total_units} — too many units to show clearly in a single "
-                    "image. Needs manual review (e.g. a representative shot or a roundel).")
             if total_units >= 2:
-                # Only rebuild (duplicate the clean photo) when the original shows
-                # FEWER units than the pack — i.e. a multiplier badge / single unit.
-                # If the original already shows the units (no badge) and is just
-                # touching, duplicating one — often lower-quality — photo makes it
-                # worse, so keep the original.
+                # The original shows FEWER units than the pack (a multiplier
+                # badge): duplicate the clean component photo — but only if that
+                # photo really is the product in the original (component photos
+                # are sometimes a different variant or even a placeholder).
                 if badge_implies_more:
+                    score = 0.0
+                    if composer and original_image_path:
+                        _, score, _ = await asyncio.to_thread(
+                            composer.measure_relative_heights,
+                            original_image_path, [components[0]['path']],
+                        )
+                    if score < self.COMPONENT_MATCH_MIN:
+                        logger.info(f"Bundle {code}: manual (component photo doesn't match, "
+                                    f"score={score:.2f})")
+                        return manual(
+                            f"Shown as fewer units than the pack of {total_units}, but the "
+                            "Boots.com product photo doesn't match the product in the original "
+                            f"(match {score:.0%}) — needs manual review.")
                     issues = [f"Shown as fewer units than the pack of {total_units} — "
                               + f"rebuilt from the clean product photo to show all {total_units}."]
                     logger.info(f"Bundle {code}: rebuild multipack x{total_units}")
-                    return await self._compose(code, title, original_image_path, products,
-                                               components, None, arrangement, composer,
-                                               uploads_dir, issues)
+                    res = await self._compose(code, title, original_image_path, products,
+                                              components, None, arrangement, composer,
+                                              uploads_dir, issues)
+                    return await self._check_rebuild(code, original_image_path, res,
+                                                     classifier, 'duplicate')
                 if verdict and verdict.get('poor_quality'):
                     logger.info(f"Bundle {code}: manual (multipack, genuine quality issue)")
                     return manual(
@@ -465,17 +629,14 @@ class BundleProcessor:
                     "the correct number of items.")
             # One product, quality issue only -> rebuild from the clean photo.
             issues = ["Rebuilt from the clean Boots.com product photo on a white background."]
-            return await self._compose(code, title, original_image_path, products,
-                                       components, None, arrangement, composer,
-                                       uploads_dir, issues)
+            res = await self._compose(code, title, original_image_path, products,
+                                      components, None, arrangement, composer,
+                                      uploads_dir, issues)
+            return await self._check_rebuild(code, original_image_path, res,
+                                             classifier, 'component')
 
-        # --- Multiple distinct products: preserve real sizes from the original ---
-        if distinct > self.MAX_ITEMS_IN_ROW:
-            logger.info(f"Bundle {code}: manual ({distinct} products too many for one row)")
-            return manual(
-                f"{distinct} different products — too many to arrange clearly in a single "
-                "image. Needs manual review.")
-
+        # --- Fallback for multiple distinct products: component photos at the
+        #     sizes measured in the original ---
         rel, score, xs = None, 0.0, None
         if composer and original_image_path:
             rel, score, xs = await asyncio.to_thread(
@@ -501,6 +662,16 @@ class BundleProcessor:
                 f"Couldn't confidently measure the products' real sizes from the original "
                 f"(best match {score:.0%}) — needs manual review to avoid wrong sizes or a "
                 "missing product.")
+        if gemini is not None and classifier is None and score < self.COMPONENT_REBUILD_STRONG:
+            # The original-image path (cut / AI separation) already failed and the
+            # component photos only loosely match the original — they're likely a
+            # different variant or carry baked-in tags. Don't guess.
+            logger.info(f"Bundle {code}: manual (original couldn't be separated; "
+                        f"component match only {score:.2f})")
+            return manual(
+                "The products overlap in the original and couldn't be separated "
+                "faithfully, and the Boots.com product photos don't closely match the "
+                f"original (match {score:.0%}) — needs manual review.")
         # Order the products left-to-right by where each one matched in the
         # original, so the rebuild keeps the original arrangement (not the
         # arbitrary catalogue order, which can flip products — e.g. No7).
@@ -510,12 +681,14 @@ class BundleProcessor:
         issues = [f"Rebuilt from {distinct} clean product photos, with each product's "
                   + "size preserved from the original and clear spacing added."]
         logger.info(f"Bundle {code}: rebuild {distinct} products, sizes preserved")
-        return await self._compose(code, title, original_image_path, products,
-                                   components, rel, arrangement, composer,
-                                   uploads_dir, issues)
+        res = await self._compose(code, title, original_image_path, products,
+                                  components, rel, arrangement, composer,
+                                  uploads_dir, issues)
+        return await self._check_rebuild(code, original_image_path, res,
+                                         classifier, 'components')
 
     async def _process_one(self, bundle: dict, crawler, composer, uploads_dir: str,
-                           classifier=None) -> dict | None:
+                           classifier=None, gemini=None, force_fix=False) -> dict | None:
         """Crawl, classify the original image, and (if needed) compose a bundle.
 
         Fast path: fetch only the original image + product metadata, then let the
@@ -564,6 +737,10 @@ class BundleProcessor:
         verdict = None
         if classifier and has_original:
             verdict = await asyncio.to_thread(classifier.classify, original_image_path)
+        # Re-checking bundles already on the dashboard: they were flagged once,
+        # so don't let a borderline re-classification drop them — work on them.
+        if force_fix and verdict is not None and verdict['usable'] and not verdict['needs_fixing']:
+            verdict = {**verdict, 'needs_fixing': True, 'overlapping': True}
 
         if verdict is not None:
             reason = verdict.get('reason') or ''
@@ -591,7 +768,7 @@ class BundleProcessor:
             components = await self._download_components(crawler, products, uploads_dir)
             return await self._rebuild_from_components(
                 code, title, original_image_path, products, components,
-                arrangement, composer, uploads_dir, verdict,
+                arrangement, composer, uploads_dir, verdict, gemini, classifier,
             )
 
         # --- Structural fallback (no vision classifier available) ---

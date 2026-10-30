@@ -49,6 +49,42 @@ _PROMPT = (
 )
 
 
+_VERIFY_PROMPT = (
+    "Image A is the ORIGINAL product-bundle photo from a retail website. Image B is a "
+    "REBUILT version that should show the very same products, just spaced out on a white "
+    "background. Check Image B against Image A. Reply with ONLY compact JSON (no markdown "
+    "fences), exactly these keys:\n"
+    '{"same_products":bool,"same_count":bool,"no_added_marks":bool,"text_intact":bool,'
+    '"no_overlap":bool,"reason":"<=16 words"}\n'
+    "- same_products: B shows the same product variants as A — same packaging design, "
+    "colours, brand and product names. A different variant, flavour, design, an open jar "
+    "instead of a closed one, a swatch or placeholder instead of the product = false.\n"
+    "- same_count: B shows the same number of product units as A (ignore any multiplier "
+    "badge in A; count the physical units the bundle should contain).\n"
+    "- no_added_marks: B has no sticker, tag, price/size box, badge or text that is not "
+    "part of the products in A.\n"
+    "- text_intact: the label text in B is legible and spelled like A. Slight softness is "
+    "fine; set false only if words are clearly misspelled, scrambled or nonsense.\n"
+    "- no_overlap: products in B do not overlap each other."
+)
+
+
+class VisionUnavailable(Exception):
+    """Gemini can't be used at all (credits used up / invalid key). Processing
+    must stop with a clear message instead of silently falling back to weaker
+    logic that produces bad images."""
+
+
+def _raise_if_unavailable(e: Exception) -> None:
+    msg = str(e)
+    low = msg.lower()
+    if "402" in msg or "credits are depleted" in low or "api key not valid" in low:
+        raise VisionUnavailable(
+            "Gemini is unavailable — the API credits are used up or the key is invalid. "
+            "Top up at https://ai.studio/projects, then click Re-check."
+        ) from e
+
+
 class VisionClassifier:
     """Classifies a bundle's original image against the catalogue rules."""
 
@@ -59,6 +95,9 @@ class VisionClassifier:
         from google.genai import types
         self._types = types
         self.client = genai.Client(api_key=self.api_key)
+        # Deterministic answers: the same image must get the same verdict on
+        # every run (otherwise bundles flip between "fine" and "needs fixing").
+        self._config = types.GenerateContentConfig(temperature=0)
         logger.info(f"VisionClassifier using model: {self.model}")
 
     def classify(self, image_path: str) -> dict | None:
@@ -70,6 +109,7 @@ class VisionClassifier:
             img.save(buf, "JPEG", quality=90)
             resp = self.client.models.generate_content(
                 model=self.model,
+                config=self._config,
                 contents=[
                     self._types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg"),
                     _PROMPT,
@@ -91,5 +131,39 @@ class VisionClassifier:
             logger.warning(f"Vision classify parse/IO error for {image_path}: {e}")
             return None
         except Exception as e:  # noqa: BLE001 — never let one image break the batch
+            _raise_if_unavailable(e)
             logger.warning(f"Vision classify failed for {image_path}: {e}")
+            return None
+
+    def _jpeg_part(self, path: str, max_dim: int):
+        img = Image.open(path).convert("RGB")
+        img.thumbnail((max_dim, max_dim))
+        buf = BytesIO()
+        img.save(buf, "JPEG", quality=90)
+        return self._types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg")
+
+    def verify(self, original_path: str, rebuilt_path: str) -> dict | None:
+        """Compare a rebuilt bundle image to the original. Returns
+        {ok, reason, ...checks} or None if the model call fails."""
+        try:
+            resp = self.client.models.generate_content(
+                model=self.model,
+                config=self._config,
+                contents=[
+                    "Image A (original):", self._jpeg_part(original_path, 1100),
+                    "Image B (rebuilt):", self._jpeg_part(rebuilt_path, 1100),
+                    _VERIFY_PROMPT,
+                ],
+            )
+            txt = (resp.text or "").strip().replace("```json", "").replace("```", "").strip()
+            d = json.loads(txt)
+            checks = {k: bool(d.get(k, False)) for k in
+                      ("same_products", "same_count", "no_added_marks", "text_intact", "no_overlap")}
+            return {**checks, "ok": all(checks.values()), "reason": str(d.get("reason", ""))[:160]}
+        except (json.JSONDecodeError, ValueError, OSError) as e:
+            logger.warning(f"Vision verify parse/IO error for {rebuilt_path}: {e}")
+            return None
+        except Exception as e:  # noqa: BLE001 — never let one image break the batch
+            _raise_if_unavailable(e)
+            logger.warning(f"Vision verify failed for {rebuilt_path}: {e}")
             return None

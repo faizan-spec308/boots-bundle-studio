@@ -6,11 +6,13 @@
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 
 /**
- * Fetch all bundles from the backend.
- * Returns categorized bundles: ready, supplier, manual.
+ * Fetch bundles from the backend (it loads in the background; poll until ready).
+ * mode: ''          — current results (or start the first load)
+ *       'reprocess' — re-run the latest rules on the bundles already shown
+ *       'force'     — scan a NEW batch of bundles
  */
-export async function fetchBundles(refresh = false) {
-  const url = `${API_BASE}/api/bundles${refresh ? '?refresh=true' : ''}`
+export async function fetchBundles(mode = '') {
+  const url = `${API_BASE}/api/bundles${mode ? `?${mode}=true` : ''}`
   const res = await fetch(url)
   if (!res.ok) throw new Error(`Failed to fetch bundles: ${res.statusText}`)
   return res.json()
