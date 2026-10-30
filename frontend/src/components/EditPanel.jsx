@@ -1,5 +1,5 @@
 import React, { useState } from 'react'
-import { editImage } from '../api/client.js'
+import { editImage, approveImage } from '../api/client.js'
 
 export default function EditPanel({ bundle, onClose, onUpdate }) {
   const [prompt, setPrompt] = useState('')
@@ -9,6 +9,8 @@ export default function EditPanel({ bundle, onClose, onUpdate }) {
   const [warnings, setWarnings] = useState([])
   const [editHistory, setEditHistory] = useState([])
   const [justApplied, setJustApplied] = useState(false)
+  const [approving, setApproving] = useState(false)
+  const [approved, setApproved] = useState(false)
 
   const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 
@@ -44,6 +46,23 @@ export default function EditPanel({ bundle, onClose, onUpdate }) {
       setError(err.message)
     } finally {
       setLoading(false)
+    }
+  }
+
+  async function handleApprove() {
+    if (approving) return
+    setApproving(true)
+    setError(null)
+    try {
+      const imagePath = editedImagePath || bundle.generated_image || bundle.original_image
+      await approveImage(bundle.code, imagePath, bundle.title)
+      setApproved(true)
+      onUpdate({ ...bundle, generated_image: imagePath })
+      setTimeout(onClose, 900)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setApproving(false)
     }
   }
 
@@ -90,7 +109,12 @@ export default function EditPanel({ bundle, onClose, onUpdate }) {
           </div>
 
           {justApplied && !loading && (
-            <div className="edit-applied">✓ Edit applied — “{lastPrompt}”</div>
+            <div className="edit-applied">
+              ✓ Edit applied — “{lastPrompt}”. Review it above, keep refining, or approve.
+            </div>
+          )}
+          {approved && (
+            <div className="edit-applied">✓ Approved — added to the export.</div>
           )}
 
           {warnings.length > 0 && (
@@ -135,8 +159,17 @@ export default function EditPanel({ bundle, onClose, onUpdate }) {
                 <><span className="spinner-sm"></span> Applying…</>
               ) : 'Apply Edit'}
             </button>
-            <button className="btn-done" onClick={onClose} disabled={loading}>
-              Done
+            {editedImagePath && (
+              <button
+                className="btn-approve"
+                onClick={handleApprove}
+                disabled={loading || approving || approved}
+              >
+                {approved ? '✓ Approved' : approving ? 'Approving…' : 'Approve this image'}
+              </button>
+            )}
+            <button className="btn-done" onClick={onClose} disabled={loading || approving}>
+              {editedImagePath ? 'Keep & close' : 'Close'}
             </button>
           </div>
 

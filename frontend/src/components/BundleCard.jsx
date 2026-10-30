@@ -193,8 +193,10 @@ export default function BundleCard({ bundle, activeTab, onUpdate }) {
           bundle={bundle}
           onClose={() => setShowEdit(false)}
           onUpdate={(updated) => {
+            // Bubble the edit up so the card reflects it, but KEEP the panel
+            // open so the user sees the result and can keep iterating.
             onUpdate(updated)
-            setShowEdit(false)
+            setImgVersion(v => v + 1)
           }}
         />
       )}

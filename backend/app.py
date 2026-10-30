@@ -100,7 +100,9 @@ _bundle_load: dict = {
     "status": "idle",       # idle | loading | ready | error
     "phase": "",
     "processed": 0,
-    "total": 0,             # bundles being processed this run
+    "total": 0,             # target number of defects to collect this run
+    "found": 0,             # defective bundles found so far
+    "scanned": 0,           # bundles scanned so far
     "live_total": 0,        # total confirmed-live bundles found
     "error": None,
     "started_at": None,
@@ -296,7 +298,14 @@ async def readyz():
 # Main API endpoints
 # ---------------------------------------------------------------------------
 
-DEFAULT_BUNDLE_LIMIT = int(os.getenv("BUNDLE_PROCESS_LIMIT", "50"))
+# How many DEFECTIVE bundles to collect before stopping (the review set). We
+# scan the confirmed-live list in chunks and stop as soon as we've found this
+# many, so the first batch is quick instead of processing a fixed count.
+DEFAULT_BUNDLE_LIMIT = int(os.getenv("BUNDLE_TARGET_DEFECTS", "25"))
+# Hard ceiling on how many defective bundles to show, and how many to scan.
+BUNDLE_MAX_SHOW = int(os.getenv("BUNDLE_MAX_SHOW", "30"))
+BUNDLE_MAX_SCAN = int(os.getenv("BUNDLE_MAX_SCAN", "250"))
+BUNDLE_SCAN_CHUNK = int(os.getenv("BUNDLE_SCAN_CHUNK", "15"))
 # Testing toggle: skip the Monday.com download and parse the local files in
 # ORIGINALS_DIR instead (also bypasses the confirmed-live cache so parsing runs).
 USE_LOCAL_FILES = os.getenv("USE_LOCAL_FILES", "").strip().lower() in ("1", "true", "yes")
@@ -322,6 +331,8 @@ def _bundles_payload() -> dict:
         "phase": s["phase"],
         "processed": s["processed"],
         "total": s["total"],
+        "found": s["found"],
+        "scanned": s["scanned"],
         "live_total": s["live_total"],
         "elapsed_seconds": elapsed,
         "error": s["error"],
@@ -384,30 +395,43 @@ async def _load_bundles_job(refresh: bool, limit: int, force: bool) -> None:
         # 2) Resolve the bundle set (test codes if set — otherwise Monday.com)
         confirmed = await _confirmed_live(refresh)
         _bundle_load["live_total"] = len(confirmed)
+        target = min(limit, BUNDLE_MAX_SHOW)
         # Sample evenly across the whole confirmed list rather than taking the
         # first N. Monday rows are grouped by product family, so the first N are
         # often near-duplicates (e.g. all nappy bags) — an even stride gives the
-        # reviewer a varied first batch.
-        if len(confirmed) > limit:
-            step = len(confirmed) / limit
-            batch = [confirmed[int(i * step)] for i in range(limit)]
+        # reviewer a varied spread.
+        max_scan = min(len(confirmed), BUNDLE_MAX_SCAN)
+        if len(confirmed) > max_scan:
+            step = len(confirmed) / max_scan
+            scan_list = [confirmed[int(i * step)] for i in range(max_scan)]
         else:
-            batch = confirmed
+            scan_list = confirmed
         _bundle_load.update(
             phase="Reviewing bundle images & rebuilding where needed…",
-            total=len(batch), processed=0,
+            total=target, processed=0, found=0, scanned=0,
         )
-        logger.info(f"Resolved {len(confirmed)} bundles (processing {len(batch)})")
+        logger.info(f"Resolved {len(confirmed)} bundles; scanning up to {len(scan_list)} "
+                    f"for {target} defects")
 
-        def _cb(done: int, _total: int) -> None:
-            _bundle_load["processed"] = done
-
-        # 3) Process + cache the results (vision classifier flags what needs fixing)
-        results = await processor.process_bundles(
-            bundles=batch, crawler=crawler, composer=composer,
-            uploads_dir=UPLOADS_DIR, progress_cb=_cb,
-            classifier=get_classifier(),
-        )
+        # 3) Scan in chunks and STOP as soon as we've collected `target` defects,
+        #    so the first batch is quick instead of processing a fixed count.
+        classifier = get_classifier()
+        results: list = []
+        scanned = 0
+        for start in range(0, len(scan_list), BUNDLE_SCAN_CHUNK):
+            piece = scan_list[start:start + BUNDLE_SCAN_CHUNK]
+            chunk_results = await processor.process_bundles(
+                bundles=piece, crawler=crawler, composer=composer,
+                uploads_dir=UPLOADS_DIR, classifier=classifier,
+            )
+            results.extend(chunk_results)
+            scanned += len(piece)
+            _bundle_load.update(
+                found=len(results), scanned=scanned, processed=min(len(results), target),
+            )
+            if len(results) >= target:
+                break
+        results = results[:BUNDLE_MAX_SHOW]
         bundle_data_cache = results
         try:
             with open(cache_path, "w") as f:  # noqa: ASYNC230 — small cache write
@@ -431,14 +455,15 @@ async def get_bundles(
     force: bool = Query(False, description="Bypass the processed-results cache and reprocess"),
     limit: int = Query(
         DEFAULT_BUNDLE_LIMIT, ge=1, le=500,
-        description="Max bundles to crawl/process per request",
+        description="How many defective bundles to collect before stopping",
     ),
 ):
     """
     Return bundles, loading them in the background so the request never blocks.
 
-    By default this uses the fixed TEST_BUNDLE_CODES and skips Monday.com entirely,
-    and serves a cached result when one is fresh (<1h) — so loads are near-instant.
+    Scans the confirmed-live list in chunks and stops once it has collected
+    `limit` defective bundles (default 25), and serves a cached result when one
+    is fresh (<1h) — so repeat loads are near-instant.
     Poll until `status` is `"ready"`, then `bundles` is populated.
       - `refresh=true`: re-fetch the real confirmed-live list from Monday.com.
       - `force=true`: bypass the processed-results cache and reprocess.

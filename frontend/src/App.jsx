@@ -13,7 +13,15 @@ export default function App() {
   const [activeTab, setActiveTab] = useState('ready')
   const [backendOnline, setBackendOnline] = useState(false)
   const [tipIndex, setTipIndex] = useState(0)
+  const [waking, setWaking] = useState(false)
   const pollRef = useRef(null)
+  const loadStartRef = useRef(0)
+  const failCountRef = useRef(0)
+
+  // The backend (Render free tier) spins down when idle and can take ~50s to
+  // wake. We keep retrying the first fetch through that window instead of
+  // failing instantly, which is what caused "Failed to fetch" on Vercel.
+  const COLD_START_WINDOW_MS = 90000
 
   // Light status lines that rotate under the real phase while loading, so the
   // wait feels alive rather than frozen. Professional, with a bit of character.
@@ -67,6 +75,8 @@ export default function App() {
   async function poll(refresh) {
     try {
       const data = await fetchBundles(refresh)
+      failCountRef.current = 0
+      setWaking(false)
       if (data.status === 'ready') {
         setBundles(data.bundles || [])
         setLiveTotal(data.live_total || (data.bundles || []).length)
@@ -86,15 +96,34 @@ export default function App() {
         pollRef.current = setTimeout(() => poll(false), 2000)
       }
     } catch (err) {
-      setError(err.message)
-      setLoading(false)
-      clearPoll()
+      // Network error — most often the backend is still cold-starting. Keep
+      // retrying (with backoff) until the wake-up window elapses, rather than
+      // failing on the very first attempt.
+      const elapsed = Date.now() - loadStartRef.current
+      if (elapsed < COLD_START_WINDOW_MS) {
+        failCountRef.current += 1
+        setWaking(true)
+        setLoading(true)
+        const backoff = Math.min(2000 + failCountRef.current * 1000, 6000)
+        pollRef.current = setTimeout(() => poll(refresh), backoff)
+      } else {
+        setWaking(false)
+        setError(
+          "Can't reach the backend. It may be starting up (the free server sleeps " +
+          "when idle) — wait a moment and hit Refresh.",
+        )
+        setLoading(false)
+        clearPoll()
+      }
     }
   }
 
   function loadBundles(refresh = false) {
     setError(null)
     setLoading(true)
+    setWaking(false)
+    failCountRef.current = 0
+    loadStartRef.current = Date.now()
     clearPoll()
     poll(refresh)
   }
@@ -171,11 +200,15 @@ export default function App() {
         {loading && bundles.length === 0 ? (
           <div className="loading-state">
             <div className="spinner"></div>
-            <p className="loading-phase">{progress?.phase || 'Getting things ready…'}</p>
-            <p className="loading-tip" key={tipIndex}>
-              {(pct !== null ? PROCESS_TIPS : DOWNLOAD_TIPS)[
-                tipIndex % (pct !== null ? PROCESS_TIPS.length : DOWNLOAD_TIPS.length)
-              ]}
+            <p className="loading-phase">
+              {waking ? 'Waking up the server…' : (progress?.phase || 'Getting things ready…')}
+            </p>
+            <p className="loading-tip" key={waking ? 'waking' : tipIndex}>
+              {waking
+                ? 'The free server sleeps when idle — this first wake-up can take up to a minute.'
+                : (pct !== null ? PROCESS_TIPS : DOWNLOAD_TIPS)[
+                    tipIndex % (pct !== null ? PROCESS_TIPS.length : DOWNLOAD_TIPS.length)
+                  ]}
             </p>
             {pct !== null && (
               <div className="progress-wrap">
@@ -183,8 +216,9 @@ export default function App() {
                   <div className="progress-fill" style={{ width: `${pct}%` }}></div>
                 </div>
                 <p className="progress-text">
-                  {progress.processed} / {progress.total} bundles processed
-                  {progress.live_total ? ` · ${progress.live_total.toLocaleString()} confirmed live` : ''}
+                  {progress.found ?? progress.processed} of ~{progress.total} bundles to review found
+                  {progress.scanned ? ` · ${progress.scanned} checked` : ''}
+                  {progress.live_total ? ` · ${progress.live_total.toLocaleString()} live` : ''}
                 </p>
               </div>
             )}

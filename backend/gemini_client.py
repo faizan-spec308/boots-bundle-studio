@@ -24,19 +24,17 @@ from PIL import Image
 logger = logging.getLogger(__name__)
 
 # Fidelity preamble prepended to every Gemini prompt
-FIDELITY_PREAMBLE = """CRITICAL PRODUCT FIDELITY RULES — FOLLOW EXACTLY:
-- Preserve each product's original packaging, colours, labels, logos, text, and branding EXACTLY as shown.
+FIDELITY_RULES = """CONSTRAINTS — keep these true while making the change:
+- Preserve each product's packaging, colours, labels, logos, text, and branding EXACTLY as shown.
 - Do NOT redesign, redraw, stylise, or reinterpret any product.
 - Do NOT stretch, compress, widen, shorten, or distort any packaging.
-- Preserve the RELATIVE SIZES of the products: a smaller product must stay smaller and a larger product larger, exactly as in the original — do NOT make all products the same size.
-- Do NOT invent, remove, duplicate, or alter product features.
-- Use the provided reference images as visual ground truth for product appearance.
-- Product accuracy takes precedence over visual creativity.
-- Keep all products on a clean, pure white background (#FFFFFF).
-- Maintain a clearly visible gap between products — they must NOT touch or overlap.
+- Preserve the RELATIVE SIZES of the products: a smaller product stays smaller, a larger one larger — do NOT make them all the same size.
+- Do NOT invent, remove, duplicate, or alter any product unless the change explicitly asks for it.
+- Keep every product on a clean, pure white background (#FFFFFF).
+- Change ONLY what the change below asks for — leave everything else pixel-identical."""
 
-EDIT INSTRUCTION:
-"""
+# Back-compat alias (older call sites concatenated this before the prompt).
+FIDELITY_PREAMBLE = FIDELITY_RULES + "\n\nEDIT INSTRUCTION:\n"
 
 
 class GeminiError(Exception):
@@ -103,12 +101,27 @@ class GeminiClient:
         Raises:
             Exception if the edit fails after retries.
         """
-        full_prompt = FIDELITY_PREAMBLE + prompt
+        instruction = (prompt or "").strip()
+        has_refs = bool(reference_images and any(os.path.exists(p) for p in reference_images))
+        # Task-first prompt: the model reads WHAT to do before the constraints,
+        # so the actual edit isn't buried under a wall of "do NOT" rules.
+        full_prompt = (
+            "You are editing the FIRST attached image — a product-bundle photo for an "
+            "e-commerce catalogue.\n\n"
+            f"MAKE THIS CHANGE (and nothing else):\n{instruction}\n\n"
+            f"{FIDELITY_RULES}\n"
+        )
+        if has_refs:
+            full_prompt += (
+                "\nThe images after the first are reference photos of the individual "
+                "products — match their exact colours, packaging, labels and branding.\n"
+            )
+        full_prompt += "\nReturn ONLY the edited image."
         max_retries = 3
 
         for attempt in range(1, max_retries + 1):
             try:
-                logger.info(f"Gemini edit attempt {attempt}/{max_retries}: '{prompt[:80]}...'")
+                logger.info(f"Gemini edit attempt {attempt}/{max_retries}: '{instruction[:80]}'")
 
                 # Build the content parts: start with the current image
                 current_image = Image.open(image_path).convert("RGB")
@@ -126,7 +139,6 @@ class GeminiClient:
                                 data=self._image_to_bytes(ref_img),
                                 mime_type="image/jpeg",
                             ))
-                    full_prompt += "\n\nThe additional images provided are reference photos of the individual products. Use them to ensure product fidelity — match their exact colours, packaging, labels, and branding."
 
                 # Add the text prompt
                 parts.append(full_prompt)
